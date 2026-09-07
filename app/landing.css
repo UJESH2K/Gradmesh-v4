@@ -1,0 +1,383 @@
+/* Marketing surface. Loaded only by the landing page, so the dashboard's CSS
+   stays about dense data and this file stays about the pitch. */
+
+.nav {
+  position: sticky;
+  top: 0;
+  z-index: 40;
+  backdrop-filter: blur(14px);
+  background: rgba(7, 8, 11, 0.74);
+  border-bottom: 1px solid transparent;
+  transition: border-color 240ms ease, background 240ms ease;
+}
+
+.nav.is-stuck {
+  border-bottom-color: var(--line);
+}
+
+.nav-inner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  height: 66px;
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  font-size: 1.02rem;
+}
+
+.brand-mark {
+  width: 22px;
+  height: 22px;
+  flex: none;
+}
+
+.nav-links {
+  display: flex;
+  align-items: center;
+  gap: 26px;
+  font-size: 0.88rem;
+  color: var(--text-dim);
+}
+
+.nav-links a:hover {
+  color: var(--text);
+}
+
+@media (max-width: 900px) {
+  .nav-links {
+    display: none;
+  }
+}
+
+/* ------------------------------------------------------------------- hero */
+
+.hero {
+  position: relative;
+  padding: clamp(64px, 11vw, 132px) 0 clamp(56px, 8vw, 104px);
+  overflow: hidden;
+}
+
+.mesh-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 0;
+  opacity: 0.85;
+  mask-image: radial-gradient(circle at 50% 42%, #000 25%, transparent 78%);
+  -webkit-mask-image: radial-gradient(circle at 50% 42%, #000 25%, transparent 78%);
+}
+
+.hero-inner {
+  position: relative;
+  z-index: 1;
+  max-width: 860px;
+}
+
+.hero-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  padding: 5px 13px 5px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--line-strong);
+  background: rgba(255, 255, 255, 0.035);
+  font-size: 0.79rem;
+  color: var(--text-dim);
+  margin-bottom: 26px;
+}
+
+.hero h1 {
+  font-size: clamp(2.5rem, 7.2vw, 4.75rem);
+  line-height: 1.02;
+  letter-spacing: -0.045em;
+  font-weight: 560;
+}
+
+.hero h1 .glow {
+  color: var(--accent);
+  text-shadow: 0 0 42px rgba(91, 124, 250, 0.35);
+}
+
+.hero-sub {
+  margin-top: 24px;
+  font-size: clamp(1.02rem, 1.6vw, 1.22rem);
+  color: var(--text-dim);
+  max-width: 620px;
+  line-height: 1.62;
+}
+
+.hero-actions {
+  margin-top: 34px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.hero-command {
+  margin-top: 34px;
+  max-width: 640px;
+}
+
+/* --------------------------------------------------------------- sections */
+
+.section {
+  padding: clamp(58px, 8vw, 108px) 0;
+  position: relative;
+}
+
+.section-head {
+  max-width: 680px;
+  margin-bottom: 44px;
+}
+
+.section-head h2 {
+  font-size: clamp(1.75rem, 3.4vw, 2.6rem);
+  letter-spacing: -0.032em;
+  margin-top: 12px;
+}
+
+.section-head p {
+  margin-top: 16px;
+  color: var(--text-dim);
+  font-size: 1.03rem;
+  line-height: 1.62;
+}
+
+.rule {
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--line-strong), transparent);
+}
+
+/* ------------------------------------------------------------------ cards */
+
+.feature {
+  padding: 24px;
+  border-radius: var(--radius);
+  border: 1px solid var(--line);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.028), rgba(255, 255, 255, 0.006));
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+  position: relative;
+  overflow: hidden;
+  transition: border-color 220ms ease, transform 220ms ease;
+}
+
+.feature:hover {
+  border-color: var(--line-strong);
+  transform: translateY(-2px);
+}
+
+.feature-index {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--accent);
+  letter-spacing: 0.06em;
+}
+
+.feature h3 {
+  font-size: 1.06rem;
+  letter-spacing: -0.018em;
+}
+
+.feature p {
+  color: var(--text-dim);
+  font-size: 0.92rem;
+  line-height: 1.6;
+}
+
+/* ------------------------------------------------------------- comparison */
+
+.split-demo {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 18px;
+}
+
+.split-card {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 22px;
+  background: rgba(255, 255, 255, 0.014);
+}
+
+.split-card.is-good {
+  border-color: rgba(91, 124, 250, 0.26);
+  background: rgba(91, 124, 250, 0.035);
+}
+
+.split-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.gantt {
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+}
+
+.gantt-row {
+  display: grid;
+  grid-template-columns: 88px 1fr 62px;
+  align-items: center;
+  gap: 12px;
+  font-size: 0.82rem;
+}
+
+.gantt-track {
+  height: 22px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.05);
+  overflow: hidden;
+  position: relative;
+}
+
+.gantt-bar {
+  height: 100%;
+  border-radius: 6px;
+  background: linear-gradient(90deg, rgba(34, 211, 238, 0.75), rgba(34, 211, 238, 0.45));
+  transform-origin: left center;
+}
+
+.gantt-bar.is-good {
+  background: linear-gradient(90deg, rgba(91, 124, 250, 0.85), rgba(91, 124, 250, 0.5));
+}
+
+.gantt-bar.is-idle {
+  background: repeating-linear-gradient(
+    45deg,
+    rgba(255, 255, 255, 0.06),
+    rgba(255, 255, 255, 0.06) 5px,
+    transparent 5px,
+    transparent 10px
+  );
+}
+
+.gantt-deadline {
+  position: absolute;
+  top: -4px;
+  bottom: -4px;
+  width: 1px;
+  background: var(--danger);
+  opacity: 0.7;
+}
+
+/* ------------------------------------------------------------------- flow */
+
+.flow {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.flow-step {
+  padding: 26px 24px;
+  border-right: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  background: rgba(255, 255, 255, 0.012);
+}
+
+.flow-step:last-child {
+  border-right: none;
+}
+
+.flow-step .num-badge {
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  display: grid;
+  place-items: center;
+  background: rgba(91, 124, 250, 0.12);
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+}
+
+@media (max-width: 780px) {
+  .flow-step {
+    border-right: none;
+    border-bottom: 1px solid var(--line);
+  }
+  .flow-step:last-child {
+    border-bottom: none;
+  }
+}
+
+/* ------------------------------------------------------------------- cta */
+
+.cta {
+  border: 1px solid rgba(91, 124, 250, 0.24);
+  border-radius: var(--radius-lg);
+  padding: clamp(34px, 6vw, 62px);
+  text-align: center;
+  background:
+    radial-gradient(700px 320px at 50% 0%, rgba(91, 124, 250, 0.12), transparent 70%),
+    rgba(255, 255, 255, 0.016);
+}
+
+.cta h2 {
+  font-size: clamp(1.8rem, 3.6vw, 2.8rem);
+  letter-spacing: -0.035em;
+  max-width: 680px;
+  margin-inline: auto;
+}
+
+/* ---------------------------------------------------------------- footer */
+
+.footer {
+  border-top: 1px solid var(--line);
+  padding: 34px 0 46px;
+  color: var(--text-faint);
+  font-size: 0.85rem;
+}
+
+/* --------------------------------------------------------- copy affordance */
+
+.copy-line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: rgba(0, 0, 0, 0.42);
+  padding: 4px 4px 4px 14px;
+}
+
+.copy-line code {
+  font-family: var(--font-mono);
+  font-size: 0.83rem;
+  color: var(--accent);
+  overflow-x: auto;
+  white-space: nowrap;
+  flex: 1;
+  padding: 7px 0;
+  scrollbar-width: none;
+}
+
+.copy-line code::-webkit-scrollbar {
+  display: none;
+}
+
+/* Elements the scroll animation reveals. Hidden up front only when the script
+   is running, so the page still reads with JavaScript disabled. */
+.js-reveal {
+  will-change: transform, opacity;
+}

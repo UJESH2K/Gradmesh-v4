@@ -1,0 +1,10 @@
+# GradMesh training plane (CUDA 12.1 build). Installed in the background after
+# the coordinator is already serving, so nobody waits on a torch download.
+--extra-index-url https://download.pytorch.org/whl/cu121
+-r requirements-control.txt
+torch==2.5.1+cu121
+torchvision==0.20.1+cu121
+ultralytics==8.4.46
+numpy
+opencv-python
+scipy

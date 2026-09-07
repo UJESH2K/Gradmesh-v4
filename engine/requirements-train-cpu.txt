@@ -1,0 +1,10 @@
+# CPU-only training plane. Used for the coordinator host (aggregation only) and
+# for machines with no supported accelerator.
+--extra-index-url https://download.pytorch.org/whl/cpu
+-r requirements-control.txt
+torch==2.5.1
+torchvision==0.20.1
+ultralytics==8.4.46
+numpy
+opencv-python
+scipy

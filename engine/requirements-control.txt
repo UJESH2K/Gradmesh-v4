@@ -1,0 +1,11 @@
+# GradMesh control plane. Installed first so the coordinator boots in seconds.
+# Nothing here pulls a multi-gigabyte wheel.
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic>=2.8
+python-multipart>=0.0.9
+pyyaml>=6.0
+requests>=2.32
+# Advertises gradmesh.local over multicast DNS so peers never type an IP.
+# Pure Python, no build step.
+zeroconf>=0.132

@@ -1,0 +1,29 @@
+.join-shell {
+  min-height: 100vh;
+  display: grid;
+  place-items: start center;
+  padding: clamp(28px, 6vw, 72px) 20px 80px;
+}
+
+.join-card {
+  width: 100%;
+  max-width: 860px;
+  padding: clamp(26px, 4vw, 44px);
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--line);
+  background:
+    radial-gradient(800px 320px at 50% -10%, rgba(91, 124, 250, 0.1), transparent 70%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.028), rgba(255, 255, 255, 0.006));
+  box-shadow: 0 50px 110px -60px rgba(0, 0, 0, 1);
+}
+
+.join-card .brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 600;
+}
+
+.join-card details summary::-webkit-details-marker {
+  display: none;
+}

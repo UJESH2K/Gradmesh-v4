@@ -1,0 +1,26 @@
+# Node
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+next-env.d.ts
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# GradMesh runtime state: datasets, shards, run artifacts, checkpoints, tokens
+.gradmesh/
+
+# Local training artifacts
+runs/
+*.pt
+
+# Environment
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
