@@ -427,6 +427,4 @@ v4's contribution is the scheduling policy that makes the answer depend on
 something other than owning matched hardware. The model, the assertions that
 pin it down, and the measurement methodology are in
 [RESEARCH.md](RESEARCH.md).
-#   G r a d m e s h - v 4  
- #   G r a d m e s h - v 4  
- 
+#
