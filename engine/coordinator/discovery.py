@@ -44,6 +44,10 @@ PROBE_PORTS = MESH_PORTS + LIVENESS_PORTS
 
 _REFUSED_ERRNOS = {errno.ECONNREFUSED, errno.ECONNRESET, 10061, 10054}
 
+# Ceiling on a single timing probe. A LAN handshake is sub-millisecond, so
+# anything near this is a device that is not really reachable.
+RTT_TIMEOUT = 0.5
+
 SCAN_TIMEOUT = 0.4
 # Sockets in flight at once. Windows' select() tops out around 512 descriptors,
 # so batches stay well under that.
@@ -59,9 +63,32 @@ class Device:
     is_coordinator: bool = False
     is_this_host: bool = False
     source: str = "scan"
+    # Fastest TCP round trip observed during the sweep, in milliseconds. This is
+    # link quality, not physical distance: a wired machine in the next building
+    # answers faster than a phone on weak Wi-Fi two metres away. The dashboard
+    # labels it accordingly.
+    rtt_ms: Optional[float] = None
+    proximity: str = "unknown"
 
     def as_dict(self) -> dict:
         return asdict(self)
+
+
+def classify_proximity(rtt_ms: Optional[float]) -> str:
+    """Bucket a round trip into something a person can read.
+
+    The thresholds come from what a home network actually looks like: a wired
+    or 5 GHz link settles around a millisecond, a healthy 2.4 GHz link sits in
+    the single digits, and anything past twenty is a device that is either far
+    from the access point, power-saving, or behind another hop.
+    """
+    if rtt_ms is None:
+        return "unknown"
+    if rtt_ms <= 3.0:
+        return "close"
+    if rtt_ms <= 20.0:
+        return "nearby"
+    return "far"
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +246,56 @@ def _reverse_dns(ip: str) -> Optional[str]:
         return None
 
 
+def measure_rtt(ports_by_ip: Dict[str, List[int]], samples: int = 3) -> Dict[str, float]:
+    """Time a real TCP handshake against hosts that have an open port.
+
+    Separate from the sweep on purpose. The sweep runs hundreds of sockets
+    through one selector, so what it measures is mostly how long the selector
+    took to reach a descriptor rather than how long the network took: the same
+    router timed at 8 ms and 114 ms seconds apart. Timing is only meaningful
+    from a small number of dedicated blocking connects.
+
+    Only hosts with a known-open port are measured. Probing an arbitrary high
+    port to earn a refusal sounds appealing and does not work: consumer devices
+    and routers drop those packets silently rather than sending a RST, so every
+    probe burns the full timeout and returns nothing. A device that answers on
+    no port simply has no measurable distance, and the dashboard says so instead
+    of inventing one.
+    """
+    targets = {ip: ports[0] for ip, ports in ports_by_ip.items() if ports}
+    if not targets:
+        return {}
+
+    def probe(item: tuple) -> Optional[float]:
+        ip, port = item
+        best: Optional[float] = None
+        for _ in range(samples):
+            connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            connection.settimeout(RTT_TIMEOUT)
+            started = time.perf_counter()
+            try:
+                connection.connect((ip, port))
+                elapsed = (time.perf_counter() - started) * 1000.0
+            except (ConnectionRefusedError, ConnectionResetError):
+                elapsed = (time.perf_counter() - started) * 1000.0
+            except OSError as exc:
+                elapsed = (
+                    (time.perf_counter() - started) * 1000.0
+                    if getattr(exc, "winerror", None) in {10054, 10061}
+                    else None
+                )
+            finally:
+                connection.close()
+            if elapsed is not None:
+                best = elapsed if best is None else min(best, elapsed)
+        return best
+
+    items = list(targets.items())
+    with ThreadPoolExecutor(max_workers=min(16, len(items))) as pool:
+        measured = dict(zip((ip for ip, _ in items), pool.map(probe, items)))
+    return {ip: round(value, 2) for ip, value in measured.items() if value is not None}
+
+
 def resolve_names(ips: Sequence[str], budget: float = 1.5) -> Dict[str, str]:
     """Reverse-resolve as many addresses as fit in a time budget.
 
@@ -288,10 +365,12 @@ def scan_network(base: Optional[str] = None) -> dict:
         elif state == "refused":
             alive.add(ip)
 
-    # Reverse DNS and the coordinator handshake only run for addresses that
+    # Timing, naming and the coordinator handshake only run for addresses that
     # actually answered, which is a handful rather than 254.
     found = sorted(alive, key=lambda item: tuple(int(part) for part in item.split(".")))
-
+    rtt = measure_rtt(
+        {ip: open_ports.get(ip, []) for ip in found if ip != self_ip}
+    )
     names = resolve_names(found)
 
     # Only addresses with 8000 open get the coordinator handshake, so the
@@ -302,18 +381,23 @@ def scan_network(base: Optional[str] = None) -> dict:
             ip for ip, ok in zip(candidates, pool.map(_is_gradmesh_coordinator, candidates)) if ok
         ) if candidates else set()
 
-    devices = [
-        Device(
-            ip=ip,
-            mac=macs.get(ip),
-            hostname=names.get(ip),
-            open_ports=sorted(set(open_ports.get(ip, []))),
-            is_coordinator=ip in coordinators,
-            is_this_host=ip == self_ip,
-            source="arp" if ip in macs else "scan",
+    devices = []
+    for ip in found:
+        # This host is not measured against itself, it is the centre of the map.
+        latency = 0.0 if ip == self_ip else rtt.get(ip)
+        devices.append(
+            Device(
+                ip=ip,
+                mac=macs.get(ip),
+                hostname=names.get(ip),
+                open_ports=sorted(set(open_ports.get(ip, []))),
+                is_coordinator=ip in coordinators,
+                is_this_host=ip == self_ip,
+                source="arp" if ip in macs else "scan",
+                rtt_ms=round(latency, 2) if latency is not None else None,
+                proximity="close" if ip == self_ip else classify_proximity(latency),
+            )
         )
-        for ip in found
-    ]
     return {
         "devices": [device.as_dict() for device in devices],
         "subnet": "%s.0/24" % self_ip.rsplit(".", 1)[0],

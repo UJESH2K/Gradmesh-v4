@@ -43,12 +43,16 @@ export function Panel({
   action,
   children,
   flush = false,
+  hidden = false,
 }: {
   title?: ReactNode;
   action?: ReactNode;
   children: ReactNode;
   flush?: boolean;
+  /** Kept mounted but not shown, so a toggled panel does not refetch on return. */
+  hidden?: boolean;
 }) {
+  if (hidden) return null;
   if (!title) return <div className="panel">{children}</div>;
   return (
     <section className="panel panel-flush">

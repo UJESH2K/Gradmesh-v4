@@ -61,6 +61,7 @@ from coordinator.scheduler import (
     fitness,
     mesh_reference,
     plan_round,
+    safe_batch_size,
     should_abort_round,
     straggler_action,
     update_reliability,
@@ -73,6 +74,9 @@ emit = bus.publish_threadsafe
 
 HEARTBEAT_TIMEOUT_SECONDS = float(os.getenv("GRADMESH_HEARTBEAT_TIMEOUT", "20"))
 SUPERVISOR_INTERVAL_SECONDS = 2.0
+# Multiples of the heartbeat timeout after which a silent node is dropped from
+# the registry entirely rather than shown as an offline member forever.
+NODE_EVICTION_MULTIPLE = 15
 MAX_ROUND_ATTEMPTS = 2
 
 # ---------------------------------------------------------------------------
@@ -448,6 +452,14 @@ def get_batch(node_id: str, _: str = Depends(require_mesh_token)):
 
 def _batch_payload(batch: dict, run: dict) -> dict:
     """The wire shape the v3 worker already understands, plus v4 fields."""
+    # Batch size is decided per device, not per run. The requested value is a
+    # ceiling; a smaller card gets whatever it can actually hold.
+    resolved_batch = safe_batch_size(
+        device_memory_mb=batch.get("device_memory_mb") or 0,
+        imgsz=run["imgsz"],
+        requested=run["batch_size"],
+        node_max=batch.get("max_batch_size"),
+    )
     return {
         "batch_id": batch["batch_id"],
         "job_id": run["id"],
@@ -458,7 +470,7 @@ def _batch_payload(batch: dict, run: dict) -> dict:
         "weights_url": "/runs/%s/weights" % run["id"],
         "base_model": run["base_model"],
         "imgsz": run["imgsz"],
-        "batch_size": min(run["batch_size"], batch.get("max_batch_size", run["batch_size"])),
+        "batch_size": resolved_batch,
         "estimated_memory_mb": batch["memory_mb"],
         "epochs": 1,
         "job_name": run["name"],
@@ -809,6 +821,10 @@ def _start_round(run_id: str) -> None:
                     (n.get("max_batch_size", run["batch_size"]) for n in pool if n["node_id"] == assignment.node_id),
                     run["batch_size"],
                 ),
+                "device_memory_mb": next(
+                    (n.get("gpu_memory_mb", 0) for n in pool if n["node_id"] == assignment.node_id),
+                    0,
+                ),
                 "weights_b64": None,
                 "metrics": None,
                 "error": None,
@@ -1145,6 +1161,12 @@ def _run_view(run_id: str) -> dict:
                 "tier": batch["tier"],
                 "round": batch["round_index"],
                 "predicted_seconds": batch["predicted_seconds"],
+                "batch_size": safe_batch_size(
+                    device_memory_mb=batch.get("device_memory_mb") or 0,
+                    imgsz=run["imgsz"],
+                    requested=run["batch_size"],
+                    node_max=batch.get("max_batch_size"),
+                ),
                 "elapsed_seconds": round(time.time() - batch["assigned_at"], 1)
                 if batch.get("assigned_at") and batch["status"] == "assigned"
                 else batch.get("elapsed_seconds"),
@@ -1221,6 +1243,10 @@ def _supervise_once() -> None:
                 batch["error"] = "worker went offline mid-round"
                 if node is not None:
                     node["reliability"] = update_reliability(node, False, policy)
+                    # Release the slot too, otherwise the node keeps reporting a
+                    # batch in flight and is never considered idle again.
+                    node["active_batches"] = 0
+                    node["allocated_memory_mb"] = 0
                 emit(
                     "shard.dropped",
                     {"run_id": batch["run_id"], "batch_id": batch["batch_id"], "reason": batch["error"]},
@@ -1281,6 +1307,22 @@ def _supervise_once() -> None:
                         "to_node": backup["node_id"],
                         "elapsed_seconds": round(elapsed, 1),
                     },
+                )
+
+        # A node that has been silent for many timeouts is gone, not slow. Keeping
+        # it would leave a phantom in every device list and in the plan preview.
+        for node_id, node in list(nodes.items()):
+            silent_for = now - float(node.get("last_seen") or now)
+            if silent_for > HEARTBEAT_TIMEOUT_SECONDS * NODE_EVICTION_MULTIPLE:
+                if any(
+                    batch.get("node_id") == node_id and batch["status"] in {"queued", "assigned"}
+                    for batch in batches.values()
+                ):
+                    continue
+                nodes.pop(node_id, None)
+                emit(
+                    "node.left",
+                    {"node_id": node_id, "name": node.get("display_name"), "reason": "stopped responding"},
                 )
 
         for run in runs.values():

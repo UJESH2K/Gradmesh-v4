@@ -42,6 +42,8 @@ v4 fixes the product around that pipeline.
 | Slow machine | the whole round waits | speculative re-execution, then dropped |
 | Aggregation | unweighted mean | sample-weighted FedAvg, damped by reliability |
 | Visibility | poll a static HTML page | live event stream, per-shard timing |
+| Watching a run | nothing until it ended | live screen, progress bar, pinned indicator |
+| Seeing who is nearby | nothing | radar view ranked by measured network distance |
 | Access control | none | dashboard accounts plus a mesh join token |
 
 ---
@@ -126,7 +128,20 @@ the launcher says so and prints the address instead.
 **The host seeing the network.** The **Discover devices** page, in the sidebar
 and the top bar, sweeps the local `/24` in about three seconds and shows every
 device on the Wi-Fi, split into what is contributing, what has the join page
-open right now, and what is idle.
+open right now, and what is idle. It draws them as a radar with this host at the
+centre, in the spirit of a file-sharing app, with a table view behind a toggle.
+
+Two rules keep that radar honest. **Radius is measured, not decorative:** it
+comes from a real TCP round trip, timed with dedicated blocking connects rather
+than read off the batched sweep, whose numbers are dominated by scheduler delay
+and varied between 8 ms and 114 ms for the same router. A device that answers on
+no port has no measurable distance and sits on an outer ring labelled as such,
+rather than being placed somewhere plausible. **Angle is a hash of the address,**
+so a machine keeps the same seat on every sweep instead of jumping around.
+
+Round trip tracks link quality, not metres. A wired machine in the next building
+answers faster than a phone on weak Wi-Fi two metres away, and the rings are
+labelled accordingly.
 
 The sweep uses two cheap signals rather than a slow ping scan. The operating
 system's ARP table already lists every device this host has exchanged frames
@@ -172,6 +187,36 @@ raw tensors instead of PyTorch state dicts. That is a second engine, not a
 feature, and it would train a much smaller model than YOLO. Worth prototyping
 only if browser-only contribution turns out to be the thing that decides whether
 people join.
+
+## Watching a run
+
+**The pinned indicator.** Bottom right of every dashboard page, whenever
+anything is training: a progress ring, the round counter, elapsed time, and a
+bar. Clicking it goes to the live screen. It hides on the training page itself
+and comes back on its own for the next run if dismissed.
+
+**The training screen** at `/dashboard/training` is the one the product revolves
+around. It carries overall progress as a single percentage and a bar ticked once
+per round, per-machine shard bars against each shard's own prediction, the last
+round's timings, and the live event feed.
+
+Progress is reported at two granularities on purpose. Round progress alone sits
+at "1 of 4" for minutes and looks stuck, so the shards finished inside the
+current round fill in the gap between round boundaries.
+
+### The 3D element
+
+`components/dashboard/TrainingRig.tsx` renders it. Drop a GLB at
+`public/models/training-rig.glb` and it is picked up on the next page load, with
+no code change and no rebuild. Until that file exists it renders a procedural GPU
+fan, so the screen works either way.
+
+What the model should contain, and how it behaves, is written up in
+`public/models/README.md`. In short: baked animation clips that loop cleanly,
+authored around the origin, embedded textures. Every clip in the file is played
+at once, so a robot arm with one clip per joint needs no configuration. Playback
+speed is driven by how much of the mesh is busy, so the rig visibly runs harder
+under load, and its accent light changes colour with the run state.
 
 ## Architecture
 
@@ -287,6 +332,25 @@ implying more.
   it writes only to a list of who is on the network, which anyone able to reach
   this host could already observe.
 
+### Guardrails for mixed hardware
+
+Two failure modes are specific to a mesh of machines nobody controls, and both
+are handled rather than left to chance.
+
+**A machine with no usable GPU** still joins, is measured, and is marked
+ineligible with the reason shown in the dashboard. It receives no shards and
+slows nobody down. The join page says this will happen before anyone installs
+anything, because a browser can only guess at graphics hardware and the agent is
+what actually decides.
+
+**Batch size is resolved per device, not per run.** The person starting the run
+picks one number, but a batch of 8 at 640px is comfortable on a 12 GB card and an
+instant out-of-memory crash on a 4 GB laptop. The requested value is treated as a
+ceiling and each machine is given whatever it can hold, from its device memory
+and the image size. Without that, one contributor with a smaller GPU fails every
+round, loses reliability for it, and is eventually dropped from a mesh they could
+have helped with.
+
 What is **not** solved: a malicious worker can return poisoned weights. There is
 no result verification, and reliability scoring only catches failure, not lying.
 Do not run this across an untrusted network.
@@ -352,8 +416,14 @@ the host's address has changed.
 **Runs will not start.** Aggregation needs PyTorch on the host. The dashboard
 banner shows install progress; wait for it, or run `npm run setup`.
 
-**A worker runs out of GPU memory.** Lower the batch size on the run form. It is
-per machine, not global.
+**A worker runs out of GPU memory.** Batch size is already capped per device, so
+this should be rare. If it still happens, lower the batch size on the run form:
+it is a ceiling for the whole run, and each machine gets at most that.
+
+**Use this machine does nothing, or the worker keeps dying.** The agent started
+from the dashboard runs detached, with its own process group and console, so the
+dev server cannot take it down. If it still will not start, check
+`.gradmesh/worker.log`, which holds its full output, and `npm run doctor`.
 
 **Intel Arc workers.** The agent installs the `+xpu` PyTorch build and takes the
 XPU trainer path automatically. Ultralytics 8.4.46 rejects the string `xpu`, so a
@@ -428,5 +498,4 @@ something other than owning matched hardware. The model, the assertions that
 pin it down, and the measurement methodology are in
 [RESEARCH.md](RESEARCH.md).
 #   G r a d m e s h - v 4  
- #   G r a d m e s h - v 4  
  

@@ -13,6 +13,9 @@ __pycache__/
 # GradMesh runtime state: datasets, shards, run artifacts, checkpoints, tokens
 .gradmesh/
 
+# 3D assets are supplied per deployment, not committed
+public/models/*.glb
+
 # Local training artifacts
 runs/
 *.pt

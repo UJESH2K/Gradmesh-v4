@@ -56,6 +56,13 @@ export default function JoinPresence({ coordinatorUrl }: { coordinatorUrl: strin
             training runtime, so the command below is what actually lends the GPU. It installs
             nothing outside your home folder and stops the moment you close the terminal.
           </p>
+
+          <div className="notice" style={{ marginTop: 14 }}>
+            <strong>If this machine has no supported GPU</strong>, the command still works. The
+            agent measures the device, reports honestly, and the mesh marks it as ineligible with
+            the reason shown. It will not be sent training work and will not slow anyone down. A
+            browser can only guess at graphics hardware, so the agent is the one that decides.
+          </div>
         </div>
       ) : null}
     </>

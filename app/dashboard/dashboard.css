@@ -311,3 +311,266 @@
     padding-inline: 16px;
   }
 }
+
+/* ------------------------------------------------------------------- dock */
+
+/* Pinned indicator for whatever is training. Present on every dashboard page
+   except the training page itself, so the answer to "is it still going" is
+   never more than a glance away. */
+.dock {
+  position: fixed;
+  right: 22px;
+  bottom: 22px;
+  z-index: 60;
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  border: 1px solid rgba(91, 124, 250, 0.35);
+  border-radius: 16px;
+  background: linear-gradient(180deg, rgba(20, 24, 34, 0.97), rgba(11, 13, 18, 0.97));
+  backdrop-filter: blur(14px);
+  box-shadow: 0 24px 60px -28px rgba(0, 0, 0, 1), 0 0 0 1px rgba(0, 0, 0, 0.4);
+  overflow: hidden;
+  max-width: min(360px, calc(100vw - 44px));
+  animation: dock-in 420ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.dock.is-waiting {
+  border-color: rgba(245, 165, 36, 0.4);
+}
+
+@keyframes dock-in {
+  from {
+    opacity: 0;
+    transform: translateY(14px) scale(0.97);
+  }
+}
+
+.dock-body {
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  padding: 13px 6px 13px 14px;
+  min-width: 0;
+  flex: 1;
+}
+
+.dock-body:hover .dock-title {
+  color: var(--accent);
+}
+
+/* Conic-gradient progress ring: no SVG, no layout, and it animates smoothly
+   because only the custom property changes. */
+.dock-ring {
+  position: relative;
+  width: 42px;
+  height: 42px;
+  flex: none;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: conic-gradient(
+    var(--accent) var(--dock-progress, 0deg),
+    rgba(255, 255, 255, 0.08) var(--dock-progress, 0deg)
+  );
+  transition: background 600ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.dock-ring::after {
+  content: "";
+  position: absolute;
+  inset: 4px;
+  border-radius: 50%;
+  background: #0b0d12;
+}
+
+.dock-ring-value {
+  position: relative;
+  z-index: 1;
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+.dock-text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  flex: 1;
+}
+
+.dock-title {
+  font-size: 0.86rem;
+  font-weight: 560;
+  transition: color 140ms ease;
+}
+
+.dock-sub {
+  font-size: 0.73rem;
+  color: var(--text-faint);
+}
+
+.dock-meter {
+  display: block;
+  height: 3px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+  margin-top: 3px;
+}
+
+.dock-meter-fill {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+  transition: width 600ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.dock-side {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  justify-content: space-between;
+  padding: 9px 11px 9px 6px;
+  border-left: 1px solid var(--line);
+}
+
+.dock-elapsed {
+  font-size: 0.7rem;
+  color: var(--text-faint);
+}
+
+.dock-close {
+  background: none;
+  border: none;
+  color: var(--text-faint);
+  font-size: 1.1rem;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 5px;
+}
+
+.dock-close:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.07);
+}
+
+@media (max-width: 720px) {
+  .dock {
+    right: 12px;
+    bottom: 12px;
+  }
+}
+
+/* --------------------------------------------------------------- training */
+
+.train-hero {
+  display: grid;
+  grid-template-columns: minmax(240px, 380px) minmax(0, 1fr);
+  gap: 26px;
+  align-items: center;
+  padding: 24px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background:
+    radial-gradient(700px 280px at 20% 0%, rgba(91, 124, 250, 0.12), transparent 70%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.028), rgba(255, 255, 255, 0.006));
+}
+
+.train-rig {
+  min-width: 0;
+}
+
+.rig {
+  position: relative;
+  width: 100%;
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: radial-gradient(circle at 50% 45%, rgba(91, 124, 250, 0.1), transparent 70%);
+}
+
+.rig-canvas {
+  width: 100%;
+  height: 100%;
+}
+
+.rig-note {
+  position: absolute;
+  left: 10px;
+  bottom: 8px;
+  font-size: 0.64rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  opacity: 0.6;
+}
+
+.train-progress {
+  min-width: 0;
+}
+
+.train-percent {
+  font-size: clamp(2.4rem, 6vw, 3.8rem);
+  font-weight: 500;
+  letter-spacing: -0.04em;
+  line-height: 1;
+  margin: 10px 0 18px;
+}
+
+.train-bar {
+  position: relative;
+  height: 12px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.07);
+  overflow: hidden;
+}
+
+.train-bar-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--accent-dim), var(--accent), var(--cyan));
+  transition: width 700ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* One tick per round boundary, so the bar reads as discrete rounds rather than
+   a continuous unknown. */
+.train-bar-tick {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: rgba(7, 8, 11, 0.65);
+}
+
+.train-state {
+  margin-top: 16px;
+  padding: 10px 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line);
+  background: rgba(0, 0, 0, 0.25);
+  font-size: 0.87rem;
+  color: var(--text-dim);
+}
+
+.train-shards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 16px;
+}
+
+.train-shard {
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.015);
+}
+
+@media (max-width: 900px) {
+  .train-hero {
+    grid-template-columns: 1fr;
+  }
+}

@@ -37,6 +37,9 @@ export default function Topbar({ role }: { role: string }) {
 
       <div className="row" style={{ gap: 8 }}>
         {role === "owner" ? <LocalWorkerToggle /> : null}
+        <Link className="btn btn-sm" href="/dashboard/training">
+          Live training
+        </Link>
         <Link className="btn btn-sm" href="/dashboard/discover">
           Discover devices
         </Link>

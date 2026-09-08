@@ -7,7 +7,10 @@ import Topbar from "@/components/dashboard/Topbar";
 import { currentUser } from "@/lib/auth";
 import { meshName } from "@/lib/config";
 
+import TrainingDock from "@/components/dashboard/TrainingDock";
+
 import "./dashboard.css";
+import "./radar.css";
 
 export const dynamic = "force-dynamic";
 
@@ -30,6 +33,7 @@ export default async function DashboardLayout({ children }: { children: React.Re
             <SetupBanner />
             {children}
           </div>
+          <TrainingDock />
         </div>
       </div>
     </MeshProvider>

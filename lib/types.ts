@@ -121,6 +121,7 @@ export type LiveShard = {
   tier: Tier;
   round: number;
   predicted_seconds: number;
+  batch_size: number;
   elapsed_seconds: number | null;
   soft_deadline_seconds: number;
   hard_deadline_seconds: number;
@@ -187,6 +188,9 @@ export type NetworkDevice = {
   is_member: boolean;
   is_visitor: boolean;
   source: "arp" | "scan";
+  /** Measured TCP round trip. Null when the device answers on no port. */
+  rtt_ms: number | null;
+  proximity: "close" | "nearby" | "far" | "unknown";
 };
 
 export type Visitor = {

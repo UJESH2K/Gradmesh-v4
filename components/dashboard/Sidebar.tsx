@@ -10,6 +10,7 @@ const LINKS = [
   { href: "/dashboard", label: "Overview", exact: true },
   { href: "/dashboard/nodes", label: "Machines" },
   { href: "/dashboard/discover", label: "Discover devices" },
+  { href: "/dashboard/training", label: "Live training" },
   { href: "/dashboard/runs", label: "Training runs" },
   { href: "/dashboard/datasets", label: "Datasets" },
   { href: "/dashboard/policy", label: "Scheduler" },

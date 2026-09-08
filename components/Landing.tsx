@@ -5,6 +5,7 @@ import Link from "next/link";
 
 import CopyLine from "./CopyLine";
 import Logo from "./Logo";
+import LiveBackground from "./LiveBackground";
 import MeshCanvas from "./MeshCanvas";
 
 type Props = {
@@ -156,6 +157,7 @@ export default function Landing({ origin, signedIn, needsFirstAccount, meshName 
       </header>
 
       <section className="hero">
+        <LiveBackground />
         <MeshCanvas />
         <div className="container hero-inner">
           <span className="hero-tag" data-hero>

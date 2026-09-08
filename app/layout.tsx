@@ -25,8 +25,13 @@ export const viewport: Viewport = {
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en">
-      <body>
+    // suppressHydrationWarning covers the <html> element only. Browser
+    // extensions such as screen recorders and password managers stamp
+    // attributes onto it before React hydrates, which React then reports as a
+    // mismatch it cannot repair. The warning is about the extension, not this
+    // app, and suppressing it here does not hide mismatches in any child.
+    <html lang="en" suppressHydrationWarning>
+      <body suppressHydrationWarning>
         <div className="shell">{children}</div>
       </body>
     </html>

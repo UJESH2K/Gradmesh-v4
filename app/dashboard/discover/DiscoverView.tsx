@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 
 import CopyLine from "@/components/CopyLine";
+import DeviceRadar from "@/components/dashboard/DeviceRadar";
 import { useMesh } from "@/components/dashboard/MeshProvider";
 import { Empty, Panel, StatTile } from "@/components/dashboard/ui";
 import { ago } from "@/lib/format";
@@ -19,6 +20,7 @@ export default function DiscoverView({
   const { request, events } = useMesh();
   const [state, setState] = useState<DiscoverState | null>(null);
   const [scanning, setScanning] = useState(false);
+  const [view, setView] = useState<"radar" | "list">("radar");
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(
@@ -103,6 +105,20 @@ export default function DiscoverView({
           <span className="small faint">
             {scan.at ? `Swept ${ago(scan.at)} in ${scan.duration_seconds}s` : "Not swept yet"}
           </span>
+          <button
+            className={`btn btn-sm${view === "radar" ? " btn-primary" : ""}`}
+            type="button"
+            onClick={() => setView("radar")}
+          >
+            Radar
+          </button>
+          <button
+            className={`btn btn-sm${view === "list" ? " btn-primary" : ""}`}
+            type="button"
+            onClick={() => setView("list")}
+          >
+            List
+          </button>
           <button className="btn btn-sm" type="button" onClick={rescan} disabled={scanning}>
             {scanning ? "Sweeping…" : "Sweep network"}
           </button>
@@ -126,6 +142,10 @@ export default function DiscoverView({
         />
         <StatTile label="Idle" value={idle.length} foot="seen but not participating" />
       </div>
+
+      {view === "radar" ? (
+        <DeviceRadar state={state} scanning={scanning} onRescan={rescan} />
+      ) : null}
 
       <Panel title="How other devices reach this host">
         <div className="stack">
@@ -231,7 +251,11 @@ export default function DiscoverView({
         </Panel>
       ) : null}
 
-      <Panel title={`Everything on the network (${devices.length})`} flush>
+      <Panel
+        title={`Everything on the network (${devices.length})`}
+        flush
+        hidden={view === "radar"}
+      >
         {devices.length === 0 ? (
           <Empty>Nothing found. Press Sweep network, or check that this host is on Wi-Fi.</Empty>
         ) : (

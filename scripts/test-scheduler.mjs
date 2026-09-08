@@ -16,8 +16,8 @@ import sys, time, json
 sys.path.insert(0, ".")
 from coordinator.scheduler import (
     MeshPolicy, admit, aggregation_weights, deadline_for, efficiency,
-    plan_round, should_abort_round, straggler_action, update_reliability,
-    update_throughput,
+    plan_round, safe_batch_size, should_abort_round, straggler_action,
+    update_reliability, update_throughput,
 )
 
 failures = []
@@ -126,6 +126,21 @@ expect("a stricter memory floor rejects more devices",
        all(d.tier == "rejected" for d in admit(pool, strict).values()))
 
 expect("efficiency is speedup over worker count", abs(efficiency(2.0, 4) - 0.5) < 1e-9)
+
+# 10. Batch size is capped per device, so one contributor's smaller GPU does not
+#     crash on a batch chosen for somebody else's card.
+expect("a small card gets a smaller batch than requested",
+       safe_batch_size(4096, 640, 16) < 16)
+expect("a large card gets what was asked for",
+       safe_batch_size(24576, 640, 16) == 16)
+expect("the guard never returns less than one",
+       safe_batch_size(1024, 1280, 16) >= 1)
+expect("the guard never exceeds the request",
+       safe_batch_size(24576, 320, 4) == 4)
+expect("a larger image size lowers the ceiling",
+       safe_batch_size(4096, 640, 16) < safe_batch_size(4096, 416, 16))
+expect("a node's own maximum is respected",
+       safe_batch_size(24576, 320, 16, node_max=2) == 2)
 
 print("")
 if failures:

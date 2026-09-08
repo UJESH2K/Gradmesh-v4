@@ -590,6 +590,44 @@ def aggregation_weights(results: Sequence[dict]) -> Dict[str, float]:
     return {batch_id: value / total for batch_id, value in scored.items()}
 
 
+# Rough activation cost of one YOLOv8n image at 640px, in MB, measured rather
+# than derived: batch 8 at 640 sits near 3.2 GB on an RTX 3050. Activation
+# memory scales with pixel count, so it is quadratic in image size.
+ACTIVATION_MB_PER_IMAGE_AT_640 = 340.0
+# Weights, gradients, optimiser state and the CUDA context, none of which
+# depend on batch size.
+FIXED_OVERHEAD_MB = 900.0
+# Never fill a card completely: fragmentation and the display output need room.
+USABLE_MEMORY_FRACTION = 0.75
+
+
+def safe_batch_size(
+    device_memory_mb: int,
+    imgsz: int,
+    requested: int,
+    node_max: Optional[int] = None,
+) -> int:
+    """Largest batch this device can hold, never above what was asked for.
+
+    This is the guardrail that matters most for a volunteer mesh. The person
+    starting the run picks one batch size for everyone, but the machines are not
+    the same: a batch of 8 at 640px is comfortable on a 12 GB card and an
+    instant out-of-memory crash on a 4 GB laptop. Without this, one contributor
+    with a smaller GPU fails every round, loses reliability for it, and
+    eventually gets dropped from a mesh they were perfectly able to help with.
+
+    Returns at least 1. A device that cannot hold even one image is caught
+    earlier by the admission gate's memory floor, not here.
+    """
+    budget = max(0.0, device_memory_mb * USABLE_MEMORY_FRACTION - FIXED_OVERHEAD_MB)
+    per_image = ACTIVATION_MB_PER_IMAGE_AT_640 * (max(32, imgsz) / 640.0) ** 2
+    affordable = int(budget // per_image) if per_image > 0 else requested
+    ceiling = max(1, min(requested, affordable if affordable > 0 else 1))
+    if node_max:
+        ceiling = min(ceiling, node_max)
+    return max(1, ceiling)
+
+
 def efficiency(speedup: float, node_count: int) -> float:
     """Parallel efficiency, the headline number for the benchmark table."""
     return _safe_div(speedup, node_count)

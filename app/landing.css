@@ -381,3 +381,16 @@
 .js-reveal {
   will-change: transform, opacity;
 }
+
+/* Moving field behind the hero. Sits under the mesh graphic, which keeps its
+   own transparent canvas on top. */
+.live-bg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 0;
+  object-fit: cover;
+  mask-image: linear-gradient(180deg, #000 55%, transparent 100%);
+  -webkit-mask-image: linear-gradient(180deg, #000 55%, transparent 100%);
+}

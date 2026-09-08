@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 
-type Status = { running: boolean; startedAt: number | null; log: string[]; trainingPlane: string };
+type Status = { running: boolean; pid: number | null; log: string[]; trainingPlane: string };
 
 /**
  * Lets the host contribute its own GPU from the dashboard.
