@@ -498,10 +498,4 @@ something other than owning matched hardware. The model, the assertions that
 pin it down, and the measurement methodology are in
 [RESEARCH.md](RESEARCH.md).
 <<<<<<< HEAD
-#   G r a d m e s h - v 4  
- 
-=======
 #
->>>>>>> 03e0f5495ffd29167bf9500a2202716334df829b
-#   G r a d m e s h - v 4  
- 
