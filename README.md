@@ -37,6 +37,8 @@ v4 fixes the product around that pipeline.
 | Joining a GPU | copy the repo, install deps, find the host IP, run a CLI | paste one line |
 | Finding the host | read an IP off the other screen | open `http://gradmesh.local:3000` |
 | Seeing the network | nothing | Discover page sweeps the subnet in ~3s |
+| Benchmarking | run it by hand, record by hand | factorial sweep, JSON, CSV and figures |
+| Accuracy | never measured | mAP per round, on a fixed held-out split |
 | Dataset | one hard-coded ZIP path | upload in the browser, registry of many |
 | Shard sizing | equal split | proportional to measured throughput |
 | Slow machine | the whole round waits | speculative re-execution, then dropped |
@@ -111,6 +113,7 @@ New-NetFirewallRule -DisplayName "GradMesh" -Direction Inbound -Protocol TCP -Lo
 | `npm run coordinator` | Control plane only, with FastAPI docs at `/docs` |
 | `npm run doctor` | Diagnose a broken setup, with a fix printed per failure |
 | `npm run test:scheduler` | Assert the scheduler's behaviour. No PyTorch required |
+| `npm run report [suite-id]` | Figures and tables from a benchmark sweep |
 
 ---
 
@@ -217,6 +220,28 @@ authored around the origin, embedded textures. Every clip in the file is played
 at once, so a robot arm with one clip per joint needs no configuration. Playback
 speed is driven by how much of the mesh is busy, so the rig visibly runs harder
 under load, and its accent light changes colour with the run state.
+
+## Benchmarking for the paper
+
+**Testing parameters** in the sidebar runs a factorial sweep over machine count,
+dataset size and partitioning strategy, repeats every cell, and writes results
+that survive a crash. `npm run report` turns a finished sweep into six matplotlib
+figures plus markdown tables.
+
+The ablation is the part worth pointing at. The scheduler can partition a round
+two ways, and the harness runs both arms over identical hardware: shards sized to
+measured capability, against equal shards. On a three-machine mix of a 4200, an
+1800 and a 700 GFLOP/s device, predicted makespan is 13.5 s proportional against
+42.9 s equal, and shard-time imbalance is 0.002 against 0.68. That turns "our
+partitioning helps" from a claim into a measurement.
+
+Two speedups are reported and they are not the same number. `speedup` is wall
+clock on one machine over wall clock here, which is what a paper means and what
+is exactly 1.0 at one machine. `parallel_speedup` is shard-time overlap within a
+round, which is a diagnostic. Quote the first.
+
+Full methodology, dataset sources, and an explicit list of what the harness does
+**not** measure are in [TESTING.md](TESTING.md).
 
 ## Architecture
 
@@ -498,10 +523,13 @@ something other than owning matched hardware. The model, the assertions that
 pin it down, and the measurement methodology are in
 [RESEARCH.md](RESEARCH.md).
 <<<<<<< HEAD
-#   G r a d m e s h - v 4  
+#   G r a d m e s h - v 4 
+ 
  
 =======
 #
 >>>>>>> 03e0f5495ffd29167bf9500a2202716334df829b
-#   G r a d m e s h - v 4  
+#   G r a d m e s h - v 4 
+ 
+ #   G r a d m e s h - v 4  
  

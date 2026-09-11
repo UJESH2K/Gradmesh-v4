@@ -15,9 +15,10 @@ const SUITE = String.raw`
 import sys, time, json
 sys.path.insert(0, ".")
 from coordinator.scheduler import (
-    MeshPolicy, admit, aggregation_weights, deadline_for, efficiency,
-    plan_round, safe_batch_size, should_abort_round, straggler_action,
-    update_reliability, update_throughput,
+    MeshPolicy, admit, aggregation_weights, calibration_factor, deadline_for,
+    efficiency, imbalance, plan_round, safe_batch_size, should_abort_round,
+    straggler_action, update_reliability, update_throughput,
+    PARTITION_EQUAL, PARTITION_PROPORTIONAL,
 )
 
 failures = []
@@ -126,6 +127,49 @@ expect("a stricter memory floor rejects more devices",
        all(d.tier == "rejected" for d in admit(pool, strict).values()))
 
 expect("efficiency is speedup over worker count", abs(efficiency(2.0, 4) - 0.5) < 1e-9)
+
+# 11. The equal-split control arm, which the load-balancing ablation compares against.
+mixed = [node("fast", 4200), node("mid", 1800), node("slow", 700)]
+prop = plan_round(mixed, 1200, strategy=PARTITION_PROPORTIONAL)
+flat = plan_round(mixed, 1200, strategy=PARTITION_EQUAL)
+expect("equal split gives every worker the same shard",
+       len(set(a.samples for a in flat.assignments)) == 1)
+expect("proportional split does not",
+       len(set(a.samples for a in prop.assignments)) > 1)
+expect("equal split is predicted to finish later",
+       flat.predicted_makespan_seconds > prop.predicted_makespan_seconds,
+       "%.1f vs %.1f" % (flat.predicted_makespan_seconds, prop.predicted_makespan_seconds))
+expect("equal split is predicted to be more imbalanced",
+       flat.predicted_imbalance > prop.predicted_imbalance * 10,
+       "%.3f vs %.3f" % (flat.predicted_imbalance, prop.predicted_imbalance))
+expect("both arms still assign every sample",
+       sum(a.samples for a in flat.assignments) == 1200)
+
+expect("observed imbalance is zero when shards finish together", imbalance([10.0, 10.0, 10.0]) == 0.0)
+expect("observed imbalance rises with spread", imbalance([5.0, 10.0, 30.0]) > 0.5)
+
+# 12. Measured and probe-derived throughput must share one scale.
+#     A machine that has finished a round reports far fewer samples per second
+#     than its probe implies, because a round carries fixed per-call costs. Left
+#     uncorrected, an identical machine that had never run looked much faster and
+#     took nearly the whole dataset.
+veteran = node("veteran", 2780, thr=2.62)
+newcomer = node("newcomer", 2776)
+expect("calibration is 1.0 before anything has been measured",
+       abs(calibration_factor([newcomer]) - 1.0) < 1e-9)
+expect("calibration reflects the measured-to-probe ratio",
+       0.0 < calibration_factor([veteran, newcomer]) < 0.5)
+
+pair = plan_round([veteran, newcomer], 1000)
+expect("a measured and an unmeasured twin are given equal shards",
+       len(pair.assignments) == 2
+       and abs(pair.assignments[0].samples - pair.assignments[1].samples) <= 2,
+       str([a.samples for a in pair.assignments]))
+expect("neither twin is dropped for being too slow", pair.rejected == [])
+
+unmeasured = plan_round([node("fast", 4200), node("slow", 700)], 1000)
+expect("with nothing measured the probe still sets the shape",
+       unmeasured.assignments[0].samples > unmeasured.assignments[1].samples)
 
 # 10. Batch size is capped per device, so one contributor's smaller GPU does not
 #     crash on a batch chosen for somebody else's card.

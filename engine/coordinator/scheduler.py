@@ -167,6 +167,12 @@ TIER_FULL = "full"
 TIER_PROBATION = "probation"
 TIER_REJECTED = "rejected"
 
+# Partitioning strategies. PROPORTIONAL is the contribution of this work;
+# EQUAL is the naive baseline it has to beat, and the benchmark harness runs
+# both over identical hardware so the comparison is not merely asserted.
+PARTITION_PROPORTIONAL = "proportional"
+PARTITION_EQUAL = "equal"
+
 
 @dataclass
 class Admission:
@@ -280,37 +286,105 @@ class RoundPlan:
     rejected: List[dict] = field(default_factory=list)
     predicted_makespan_seconds: float = 0.0
     predicted_serial_seconds: float = 0.0
+    strategy: str = PARTITION_PROPORTIONAL
 
     @property
     def predicted_speedup(self) -> float:
         return _safe_div(self.predicted_serial_seconds, self.predicted_makespan_seconds)
+
+    @property
+    def predicted_imbalance(self) -> float:
+        """Coefficient of variation of predicted finish times.
+
+        Zero means every worker is expected to finish at the same instant, which
+        is the goal. This is the headline number for the partitioning ablation,
+        and it is predicted rather than observed, so it can be compared against
+        the measured spread after the round to show the model was right.
+        """
+        times = [a.predicted_seconds for a in self.assignments]
+        if len(times) < 2:
+            return 0.0
+        mean = sum(times) / len(times)
+        if mean <= 0:
+            return 0.0
+        variance = sum((value - mean) ** 2 for value in times) / len(times)
+        return (variance ** 0.5) / mean
 
     def as_dict(self) -> dict:
         return {
             "total_samples": self.total_samples,
             "assignments": [a.as_dict() for a in self.assignments],
             "rejected": self.rejected,
+            "strategy": self.strategy,
             "predicted_makespan_seconds": round(self.predicted_makespan_seconds, 2),
             "predicted_serial_seconds": round(self.predicted_serial_seconds, 2),
             "predicted_speedup": round(self.predicted_speedup, 3),
+            "predicted_imbalance": round(self.predicted_imbalance, 4),
         }
 
 
-def effective_throughput(node: dict, policy: MeshPolicy = DEFAULT_POLICY) -> float:
-    """Samples per second for this node.
+def probe_throughput(node: dict) -> float:
+    """Samples per second implied by the startup probe alone.
 
-    Prefer the measured EWMA once the node has finished at least one round.
-    Before that, fall back to the startup probe. The calibration constant only
-    has to be consistent across devices, because sharding uses ratios rather
-    than absolute times: a YOLOv8n step at imgsz 640 is roughly 9 GFLOP of
-    useful work per image once backward and optimiser traffic are included, and
-    real utilisation on consumer parts sits near 12 percent of peak FP32 matmul.
+    A YOLOv8n step at imgsz 640 is roughly 9 GFLOP of useful work per image once
+    backward and optimiser traffic are included, and real utilisation on
+    consumer parts sits near 12 percent of peak FP32 matmul. The absolute
+    constant matters less than consistency, because sharding uses ratios.
+    """
+    gflops = float((node.get("capability") or {}).get("gflops") or 0.0)
+    return max(0.05, gflops * 0.12 / 9.0)
+
+
+def calibration_factor(nodes: Sequence[dict]) -> float:
+    """Scale probe estimates onto the same scale as measured throughput.
+
+    The probe estimates steady-state compute. A measured round also contains
+    everything Ultralytics does once per call: the AMP check, dataloader
+    construction, model setup and final validation. On a small shard those fixed
+    costs dominate, so a machine that has finished a round reports far fewer
+    samples per second than its probe implies. Measured on this hardware the gap
+    was 2.6 against 37, a factor of fourteen.
+
+    Mixing the two scales in one plan is what does the damage: a node that had
+    never run looked fourteen times faster than an identical node that had, so
+    the planner handed it nearly the whole dataset and dropped the other for
+    falling under the minimum shard size.
+
+    So probe values are multiplied by the ratio this mesh actually achieves,
+    taken as the median over nodes that have both numbers. With no measurements
+    yet the factor is 1.0 and every node is on the probe scale together, which is
+    equally consistent. This corrects the scale, not the shape: relative
+    differences between devices still come from the probe.
+    """
+    ratios = [
+        float(node.get("throughput_sps") or 0.0) / probe_throughput(node)
+        for node in nodes
+        if float(node.get("throughput_sps") or 0.0) > 0
+    ]
+    if not ratios:
+        return 1.0
+    ratios.sort()
+    middle = len(ratios) // 2
+    median = ratios[middle] if len(ratios) % 2 else (ratios[middle - 1] + ratios[middle]) / 2.0
+    # Clamp so one pathological round cannot distort every future plan.
+    return max(0.01, min(100.0, median))
+
+
+def effective_throughput(
+    node: dict,
+    policy: MeshPolicy = DEFAULT_POLICY,
+    calibration: float = 1.0,
+) -> float:
+    """Samples per second for this node, on a single consistent scale.
+
+    Measured throughput wins once the node has finished a round. Before that the
+    probe estimate is used, scaled by `calibration` so it is comparable with the
+    measured values of its peers.
     """
     measured = float(node.get("throughput_sps") or 0.0)
     if measured > 0:
         return measured
-    gflops = float((node.get("capability") or {}).get("gflops") or 0.0)
-    return max(0.05, gflops * 0.12 / 9.0)
+    return max(0.01, probe_throughput(node) * calibration)
 
 
 def _proportional_with_caps(rates: Dict[str, float], caps: Dict[str, float]) -> Dict[str, float]:
@@ -354,6 +428,7 @@ def plan_round(
     total_samples: int,
     policy: MeshPolicy = DEFAULT_POLICY,
     now: Optional[float] = None,
+    strategy: str = PARTITION_PROPORTIONAL,
 ) -> RoundPlan:
     """Size every shard so all admitted workers finish together.
 
@@ -362,6 +437,12 @@ def plan_round(
     r_i. We then apply the probation cap and the skew cap, redistribute any
     trimmed samples over the remaining headroom, and finally repair rounding so
     the shards sum back to exactly total_samples.
+
+    Passing strategy=PARTITION_EQUAL gives every admitted worker the same number
+    of samples instead. That is deliberately the wrong policy for heterogeneous
+    hardware, and it exists so the benchmark harness can measure how wrong: it
+    is the control arm for the load-balancing ablation. Admission, deadlines and
+    aggregation are identical in both arms, so the only variable is shard size.
     """
     if total_samples <= 0:
         return RoundPlan(total_samples=0)
@@ -381,26 +462,37 @@ def plan_round(
     ]
 
     if not eligible:
-        return RoundPlan(total_samples=total_samples, rejected=rejected)
+        return RoundPlan(total_samples=total_samples, rejected=rejected, strategy=strategy)
 
-    rates = {n["node_id"]: effective_throughput(n, policy) for n in eligible}
+    # One scale for every node, whether measured or merely probed.
+    calibration = calibration_factor(eligible)
+    rates = {n["node_id"]: effective_throughput(n, policy, calibration) for n in eligible}
 
-    # Skew cap: a device that is 40x slower still needs enough samples for its
-    # gradient to mean something, so clamp the ratio before proportioning.
-    fastest = max(rates.values())
-    floor_rate = fastest / policy.max_shard_skew
-    rates = {node_id: max(rate, floor_rate) for node_id, rate in rates.items()}
+    if strategy == PARTITION_EQUAL:
+        # The control arm. Every admitted worker carries the same share, which
+        # is what a scheduler that ignores capability does. Rates are still
+        # measured, because the predicted finish times are what expose the
+        # imbalance this arm is meant to demonstrate.
+        share = 1.0 / len(rates)
+        shares = {node_id: share for node_id in rates}
+    else:
+        # Skew cap: a device that is 40x slower still needs enough samples for
+        # its gradient to mean something, so clamp the ratio before
+        # proportioning.
+        fastest = max(rates.values())
+        floor_rate = fastest / policy.max_shard_skew
+        rates = {node_id: max(rate, floor_rate) for node_id, rate in rates.items()}
 
-    caps = {
-        node_id: (
-            policy.probation_shard_cap
-            if decisions[node_id].tier == TIER_PROBATION
-            else 1.0
-        )
-        for node_id in rates
-    }
+        caps = {
+            node_id: (
+                policy.probation_shard_cap
+                if decisions[node_id].tier == TIER_PROBATION
+                else 1.0
+            )
+            for node_id in rates
+        }
 
-    shares = _proportional_with_caps(rates, caps)
+        shares = _proportional_with_caps(rates, caps)
 
     raw = {node_id: share * total_samples for node_id, share in shares.items()}
     samples = {node_id: int(math.floor(value)) for node_id, value in raw.items()}
@@ -426,7 +518,7 @@ def plan_round(
         rates.pop(node_id, None)
 
     if not samples:
-        return RoundPlan(total_samples=total_samples, rejected=rejected)
+        return RoundPlan(total_samples=total_samples, rejected=rejected, strategy=strategy)
 
     # Largest-remainder repair so the shards sum to exactly total_samples.
     deficit = total_samples - sum(samples.values())
@@ -470,6 +562,7 @@ def plan_round(
         rejected=rejected,
         predicted_makespan_seconds=makespan,
         predicted_serial_seconds=serial,
+        strategy=strategy,
     )
 
 
@@ -626,6 +719,23 @@ def safe_batch_size(
     if node_max:
         ceiling = min(ceiling, node_max)
     return max(1, ceiling)
+
+
+def imbalance(seconds: Sequence[float]) -> float:
+    """Coefficient of variation of observed shard times.
+
+    The measured counterpart to RoundPlan.predicted_imbalance, and the metric
+    the load-balancing ablation reports. Dimensionless, so it is comparable
+    across dataset sizes and hardware, which raw seconds are not.
+    """
+    values = [float(value) for value in seconds if value and value > 0]
+    if len(values) < 2:
+        return 0.0
+    mean = sum(values) / len(values)
+    if mean <= 0:
+        return 0.0
+    variance = sum((value - mean) ** 2 for value in values) / len(values)
+    return (variance ** 0.5) / mean
 
 
 def efficiency(speedup: float, node_count: int) -> float:

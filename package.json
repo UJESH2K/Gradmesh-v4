@@ -12,6 +12,7 @@
     "worker": "node scripts/worker.mjs",
     "doctor": "node scripts/doctor.mjs",
     "test:scheduler": "node scripts/test-scheduler.mjs",
+    "report": "node scripts/report.mjs",
     "lint": "next lint"
   },
   "dependencies": {

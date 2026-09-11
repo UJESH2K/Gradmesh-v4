@@ -238,3 +238,152 @@ export type DiscoverState = {
   }[];
   idle_count: number;
 };
+
+// ---------------------------------------------------------------------------
+// Benchmark suites
+// ---------------------------------------------------------------------------
+
+export type PartitionStrategy = "proportional" | "equal";
+
+export type SuiteConfig = {
+  name: string;
+  base_model: string;
+  parent_dataset_id: string | null;
+  dataset_sizes: number[];
+  node_counts: number[];
+  strategies: PartitionStrategy[];
+  repeats: number;
+  rounds: number;
+  imgsz: number;
+  batch_size: number;
+  node_selection: "strongest" | "random";
+  evaluate: boolean;
+  network_label: string;
+  notes: string;
+  trial_timeout_seconds: number;
+  settle_seconds: number;
+};
+
+export type TrialSpec = {
+  trial_id: string;
+  index: number;
+  node_count: number;
+  sample_count: number;
+  strategy: PartitionStrategy;
+  repeat: number;
+  node_ids: string[];
+  dataset_id: string | null;
+  label: string;
+};
+
+export type TrialResult = {
+  trial_id: string;
+  index: number;
+  label: string;
+  status: "done" | "failed" | "skipped" | "aborted";
+  error: string | null;
+  run_id: string | null;
+  node_count: number;
+  sample_count: number;
+  strategy: PartitionStrategy;
+  repeat: number;
+  rounds_completed: number;
+  train_seconds: number;
+  serial_estimate_seconds: number;
+  eval_seconds: number;
+  /** Against the one-machine baseline at the same dataset size. */
+  speedup: number | null;
+  efficiency: number | null;
+  /** Shard-time overlap inside a round. Diagnostic, not the headline. */
+  parallel_speedup?: number | null;
+  baseline_train_seconds?: number | null;
+  map50: number | null;
+  map50_95: number | null;
+  mean_imbalance: number | null;
+  mean_straggler_gap_seconds: number | null;
+  comm_bytes: number;
+  comm_seconds: number;
+  comm_fraction: number | null;
+};
+
+export type SuiteCell = {
+  node_count: number;
+  sample_count: number;
+  strategy: PartitionStrategy;
+  runs: number;
+  train_seconds_mean: number | null;
+  train_seconds_std: number | null;
+  speedup_mean: number | null;
+  speedup_std: number | null;
+  parallel_speedup_mean?: number | null;
+  efficiency_mean: number | null;
+  efficiency_std: number | null;
+  map50_mean: number | null;
+  map50_std: number | null;
+  mean_imbalance_mean: number | null;
+  baseline_map50: number | null;
+  delta_map50: number | null;
+};
+
+export type Suite = {
+  id: string;
+  created_at: number;
+  started_at: number | null;
+  finished_at: number | null;
+  status: "pending" | "running" | "done" | "aborted" | "failed" | "interrupted";
+  config: SuiteConfig;
+  trials: TrialSpec[];
+  results: TrialResult[];
+  current_trial: TrialSpec | null;
+  cells: SuiteCell[];
+  estimated_seconds: number;
+  is_active?: boolean;
+  error?: string | null;
+  environment: {
+    coordinator: Record<string, unknown>;
+    dataset: { id: string; name: string; train_count: number; val_count: number; class_names: string[] };
+    nodes: {
+      node_id: string;
+      name: string | null;
+      gpu: string | null;
+      backend: string | null;
+      memory_mb: number | null;
+      capability: Record<string, unknown> | null;
+    }[];
+  };
+};
+
+export type SuiteIndexEntry = {
+  id: string;
+  name: string;
+  status: Suite["status"];
+  created_at: number;
+  finished_at: number | null;
+  total_trials: number;
+  completed_trials: number;
+  failed_trials: number;
+  network_label: string;
+};
+
+export type BenchmarkIndex = {
+  suites: SuiteIndexEntry[];
+  active_suite_id: string | null;
+  available_nodes: number;
+  nodes: {
+    node_id: string;
+    name: string | null;
+    gpu: string | null;
+    backend: string | null;
+    memory_mb: number | null;
+    gflops: number | null;
+    throughput_sps: number | null;
+  }[];
+  torch_ready: boolean;
+};
+
+export type SuitePreview = {
+  trials: number;
+  estimated_seconds: number;
+  available_nodes: number;
+  breakdown: TrialSpec[];
+};

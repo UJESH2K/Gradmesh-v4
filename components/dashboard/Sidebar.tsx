@@ -14,6 +14,7 @@ const LINKS = [
   { href: "/dashboard/runs", label: "Training runs" },
   { href: "/dashboard/datasets", label: "Datasets" },
   { href: "/dashboard/policy", label: "Scheduler" },
+  { href: "/dashboard/testing", label: "Testing parameters" },
   { href: "/dashboard/invite", label: "Invite a GPU" },
 ];
 

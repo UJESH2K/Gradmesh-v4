@@ -7,3 +7,5 @@ ultralytics==8.4.46
 numpy
 opencv-python
 scipy
+# Figures for the benchmark report.
+matplotlib>=3.8

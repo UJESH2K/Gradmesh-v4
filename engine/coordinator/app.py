@@ -35,7 +35,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 from threading import RLock
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 # The engine directory holds the v3 modules that must stay importable by name.
 ENGINE_DIR = Path(__file__).resolve().parent.parent
@@ -47,7 +47,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from coordinator import aggregation, discovery, sharding, store
+from coordinator import aggregation, benchmark, discovery, evaluation, sharding, store
 from coordinator.events import bus
 
 from coordinator.scheduler import (
@@ -60,6 +60,9 @@ from coordinator.scheduler import (
     efficiency,
     fitness,
     mesh_reference,
+    PARTITION_EQUAL,
+    PARTITION_PROPORTIONAL,
+    imbalance,
     plan_round,
     safe_batch_size,
     should_abort_round,
@@ -89,6 +92,11 @@ runs: Dict[str, dict] = {}
 batches: Dict[str, dict] = {}
 aggregator = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gradmesh-agg")
 scanner = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gradmesh-scan")
+# One thread, one sweep. Two benchmark sweeps at once would share GPUs and
+# neither set of timings would mean anything.
+sweeper = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gradmesh-sweep")
+suite_lock = RLock()
+active_suite: Dict[str, Any] = {"id": None, "abort": False}
 
 # Devices that opened the join page but have not installed the agent. This is
 # how the host sees "my other laptop is here, looking at the join screen right
@@ -247,6 +255,21 @@ class CreateRunRequest(BaseModel):
     batch_size: int = Field(default=8, ge=1, le=128)
     mode: str = Field(default="mesh")  # mesh or solo
     notes: Optional[str] = None
+    # Restrict the run to specific machines. The benchmark harness uses this to
+    # hold hardware constant while varying node count, which is the only way a
+    # scaling curve means anything.
+    node_ids: Optional[List[str]] = None
+    partition_strategy: str = Field(default=PARTITION_PROPORTIONAL)
+    # Score the aggregated model after every round. Off by default because it
+    # costs real time; the benchmark harness turns it on.
+    evaluate: bool = False
+    suite_id: Optional[str] = None
+    trial_id: Optional[str] = None
+    # Training seed. Ultralytics defaults to 0 and sets deterministic mode, so
+    # without varying this every repeat of a cell returns bit-identical
+    # accuracy and the standard deviation a reviewer asked for is always zero.
+    # Timing still varies; accuracy does not.
+    seed: int = 0
 
 
 class PolicyRequest(BaseModel):
@@ -285,6 +308,7 @@ async def lifespan(app: FastAPI):
         await loop.run_in_executor(None, advertiser.stop)
         aggregator.shutdown(wait=False)
         scanner.shutdown(wait=False)
+        sweeper.shutdown(wait=False)
 
 
 app = FastAPI(title="GradMesh Coordinator", version="4.0.0", lifespan=lifespan)
@@ -473,6 +497,7 @@ def _batch_payload(batch: dict, run: dict) -> dict:
         "batch_size": resolved_batch,
         "estimated_memory_mb": batch["memory_mb"],
         "epochs": 1,
+        "seed": int(run.get("seed") or 0),
         "job_name": run["name"],
         "class_names": run["class_names"],
         "current_round": run["current_round"],
@@ -508,7 +533,23 @@ def submit_round_result(req: RoundResultRequest, _: str = Depends(require_mesh_t
         node = nodes.get(req.node_id)
         if node is not None:
             policy = current_policy()
-            node["throughput_sps"] = update_throughput(node, batch["samples"], elapsed, policy)
+            # Throughput must measure compute, not the round.
+            #
+            # Round elapsed also contains the shard download, the checkpoint
+            # load, Ultralytics start-up and validation, all of which are fixed
+            # costs that do not scale with shard size. Dividing samples by it
+            # made a machine that had finished a round read at 2.1 samples/s
+            # while an identical machine that had only been probed read at 37,
+            # so the planner handed almost the whole dataset to whichever node
+            # had never run. The worker reports the time inside the training
+            # call, which is the quantity the probe estimates too, so the two
+            # are finally comparable.
+            metrics = req.metrics or {}
+            train_seconds = float(metrics.get("train_seconds") or 0.0)
+            measured_seconds = train_seconds if train_seconds > 0 else elapsed
+            node["throughput_sps"] = update_throughput(
+                node, batch["samples"], measured_seconds, policy
+            )
             node["reliability"] = update_reliability(node, True, policy)
             node["completed_rounds"] = node.get("completed_rounds", 0) + 1
             node["samples_trained"] = node.get("samples_trained", 0) + batch["samples"]
@@ -598,6 +639,21 @@ def create_run(req: CreateRunRequest, _: str = Depends(require_mesh_token)):
             detail="The training plane is still installing. Aggregation needs torch on the host.",
         )
 
+    if req.partition_strategy not in {PARTITION_PROPORTIONAL, PARTITION_EQUAL}:
+        raise HTTPException(
+            status_code=400,
+            detail="partition_strategy must be %s or %s" % (PARTITION_PROPORTIONAL, PARTITION_EQUAL),
+        )
+
+    manifest = dataset.get("manifest_path")
+    dataset_root = Path(dataset["extracted_path"])
+    try:
+        total_samples = sharding.count_training_samples(
+            dataset_root, Path(manifest) if manifest else None
+        )
+    except Exception:
+        total_samples = int(dataset.get("train_count") or 0)
+
     run_id = uuid.uuid4().hex[:12]
     now = time.time()
     run = {
@@ -611,7 +667,18 @@ def create_run(req: CreateRunRequest, _: str = Depends(require_mesh_token)):
         "dataset_id": dataset["id"],
         "dataset_name": dataset["name"],
         "class_names": dataset.get("class_names") or ["object"],
-        "total_samples": int(dataset.get("train_count") or 0),
+        "total_samples": total_samples,
+        "dataset_manifest": manifest,
+        "dataset_root": str(dataset_root),
+        "node_ids": req.node_ids,
+        "partition_strategy": req.partition_strategy,
+        "seed": int(req.seed),
+        "evaluate": bool(req.evaluate),
+        "suite_id": req.suite_id,
+        "trial_id": req.trial_id,
+        "accuracy_history": [],
+        "eval_seconds_total": 0.0,
+        "comm_bytes_total": 0,
         "base_model": Path(req.base_model).name,
         "rounds": req.rounds,
         "current_round": 0,
@@ -704,6 +771,13 @@ def get_run_weights(run_id: str, _: str = Depends(require_mesh_token)):
         run = runs.get(run_id)
         if run is None:
             raise HTTPException(status_code=404, detail="Unknown run")
+        # Charge this transfer to whichever shard is currently assigned on this
+        # run, so communication accounting includes the download leg.
+        pulled = evaluation.decoded_size_bytes(run.get("weights_b64"))
+        if pulled:
+            for batch in batches.values():
+                if batch["run_id"] == run_id and batch["status"] == "assigned":
+                    batch["weights_in_bytes"] = pulled
         return {
             "job_id": run_id,
             "base_model": run["base_model"],
@@ -742,14 +816,20 @@ def _start_round(run_id: str) -> None:
         round_index = run["current_round"]
         total_samples = run["total_samples"]
         mode = run["mode"]
+        allowlist = run.get("node_ids")
+        strategy = run.get("partition_strategy", PARTITION_PROPORTIONAL)
 
     candidates = [node for node in pool if node.get("active") and node.get("supports_training", True)]
+
+    if allowlist:
+        wanted = set(allowlist)
+        candidates = [node for node in candidates if node["node_id"] in wanted]
 
     if mode == "solo" and candidates:
         mesh = mesh_reference(candidates)
         candidates = [max(candidates, key=lambda node: fitness(node, mesh, policy))]
 
-    plan = plan_round(candidates, total_samples, policy)
+    plan = plan_round(candidates, total_samples, policy, strategy=strategy)
 
     if not plan.assignments:
         with state_lock:
@@ -759,7 +839,11 @@ def _start_round(run_id: str) -> None:
             "run.waiting",
             {
                 "run_id": run_id,
-                "reason": "no eligible worker is online",
+                "reason": (
+                    "none of the %d requested machines are eligible" % len(allowlist)
+                    if allowlist
+                    else "no eligible worker is online"
+                ),
                 "rejected": plan.rejected,
             },
         )
@@ -779,12 +863,14 @@ def _start_round(run_id: str) -> None:
     # that biases local gradients before aggregation sees them.
     if shard_dir.exists():
         shutil.rmtree(shard_dir, ignore_errors=True)
+    run_manifest = run.get("dataset_manifest")
     shards = sharding.build_proportional_shards(
         Path(dataset["extracted_path"]),
         shard_dir,
         sizes,
         run["class_names"],
-        seed=round_index,
+        seed=round_index + int(run.get("seed") or 0) * 1009,
+        manifest=Path(run_manifest) if run_manifest else None,
     )
     _prune_old_rounds(run_id, round_index)
 
@@ -829,6 +915,8 @@ def _start_round(run_id: str) -> None:
                 "metrics": None,
                 "error": None,
                 "speculative_for": None,
+                "shard_bytes": int(shard.get("bytes") or 0),
+                "weights_in_bytes": 0,
             }
         )
 
@@ -1028,6 +1116,24 @@ def _aggregate_round(run_id: str, round_index: int) -> None:
     fastest = min((batch.get("elapsed_seconds") or 0.0) for batch in done) if done else 0.0
     serial_estimate = sum(batch.get("elapsed_seconds") or 0.0 for batch in done)
     wall_clock = time.time() - round_started_at
+    shard_times = [batch.get("elapsed_seconds") or 0.0 for batch in done]
+
+    # Communication accounting. Every worker pulls a shard and the current
+    # global weights, then pushes its updated weights back. Reported as bytes
+    # and as a share of round wall clock, because "how much of the round was
+    # network" is the number that decides whether this scales past a LAN.
+    shard_bytes = sum(int(batch.get("shard_bytes") or 0) for batch in done)
+    weights_down = sum(int(batch.get("weights_in_bytes") or 0) for batch in done)
+    weights_up = sum(
+        evaluation.decoded_size_bytes(batch.get("weights_b64")) for batch in done
+    )
+    comm_bytes = shard_bytes + weights_down + weights_up
+    # Workers report their own train time, so anything else they spent in the
+    # round was transfer and setup.
+    comm_seconds = sum(
+        max(0.0, (batch.get("elapsed_seconds") or 0.0) - float((batch.get("metrics") or {}).get("train_seconds") or 0.0))
+        for batch in done
+    )
 
     record = {
         "round": round_index,
@@ -1039,6 +1145,12 @@ def _aggregate_round(run_id: str, round_index: int) -> None:
         "straggler_gap_seconds": round(makespan - fastest, 2),
         "aggregation_seconds": round(aggregation_seconds, 2),
         "wall_clock_seconds": round(wall_clock, 2),
+        "imbalance": round(imbalance(shard_times), 4),
+        "predicted_imbalance": float((run.get("plan") or {}).get("predicted_imbalance") or 0.0),
+        "comm_bytes": comm_bytes,
+        "comm_seconds": round(comm_seconds, 2),
+        "comm_fraction": round(comm_seconds / (serial_estimate or 1.0), 4),
+        "strategy": run.get("partition_strategy", PARTITION_PROPORTIONAL),
         # Serial time is the sum of the shard times actually observed, which is
         # what one machine would have spent doing all of this work at the
         # measured per-shard rates.
@@ -1060,11 +1172,34 @@ def _aggregate_round(run_id: str, round_index: int) -> None:
         ],
     }
 
+    accuracy = _evaluate_round(run_id, encoded, round_index)
+    if accuracy:
+        record["accuracy"] = accuracy
+
     with state_lock:
         run = runs.get(run_id)
         if run is None:
             return
         run["weights_b64"] = encoded
+        run["comm_bytes_total"] = int(run.get("comm_bytes_total", 0)) + comm_bytes
+        if accuracy and accuracy.get("ok"):
+            run["eval_seconds_total"] = float(run.get("eval_seconds_total", 0.0)) + float(
+                accuracy.get("seconds") or 0.0
+            )
+            run["accuracy_history"].append(
+                {
+                    "round": round_index,
+                    "map50": accuracy.get("map50"),
+                    "map50_95": accuracy.get("map50_95"),
+                    # Cumulative *training* seconds, excluding evaluation. This
+                    # is the x-axis for time-to-accuracy.
+                    "train_seconds": round(
+                        sum(item.get("wall_clock_seconds", 0.0) for item in run["round_history"])
+                        + record["wall_clock_seconds"],
+                        2,
+                    ),
+                }
+            )
         run["round_history"].append(record)
         run["current_round"] = round_index + 1
         run["round_attempts"] = 0
@@ -1083,6 +1218,48 @@ def _aggregate_round(run_id: str, round_index: int) -> None:
         _archive_run(run_id)
     else:
         _start_round(run_id)
+
+
+def _evaluate_round(run_id: str, encoded_weights: str, round_index: int) -> Optional[dict]:
+    """Score the aggregated model, if this run asked for it.
+
+    Runs on the aggregator thread, after the round's wall clock has been
+    recorded, so evaluation never inflates a training measurement.
+    """
+    with state_lock:
+        run = runs.get(run_id)
+        if run is None or not run.get("evaluate"):
+            return None
+        dataset_root = Path(run["dataset_root"])
+        class_names = run["class_names"]
+        imgsz = run["imgsz"]
+        base_model = run["base_model"]
+
+    try:
+        workdir = store.run_dir(run_id) / "eval"
+        eval_yaml = evaluation.write_eval_yaml(dataset_root, workdir / "eval.yaml", class_names)
+        result = evaluation.evaluate_weights(
+            weights_b64=encoded_weights,
+            base_model_path=store.MODELS_DIR / base_model,
+            eval_yaml=eval_yaml,
+            imgsz=imgsz,
+            workdir=workdir,
+        )
+    except Exception as exc:
+        result = {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc), "seconds": 0.0}
+
+    emit(
+        "round.evaluated",
+        {
+            "run_id": run_id,
+            "round": round_index,
+            "ok": result.get("ok"),
+            "map50": result.get("map50"),
+            "seconds": result.get("seconds"),
+            "error": result.get("error"),
+        },
+    )
+    return result
 
 
 def _write_artifact(run_id: str, encoded_weights: str) -> None:
@@ -1118,6 +1295,10 @@ def _run_summary(run: dict) -> dict:
     total_wall = sum(item.get("wall_clock_seconds", 0.0) for item in history)
     total_serial = sum(item.get("serial_estimate_seconds", 0.0) for item in history)
     peak_workers = max((item.get("workers", 0) for item in history), default=0)
+    accuracy = run.get("accuracy_history") or []
+    latest = accuracy[-1] if accuracy else None
+    best = max((item.get("map50") or 0.0 for item in accuracy), default=0.0)
+    imbalances = [item.get("imbalance", 0.0) for item in history if item.get("imbalance") is not None]
     return {
         "id": run["id"],
         "name": run["name"],
@@ -1139,6 +1320,18 @@ def _run_summary(run: dict) -> dict:
         "efficiency": round(efficiency(total_serial / total_wall if total_wall else 0.0, max(1, peak_workers)), 3),
         "peak_workers": peak_workers,
         "has_artifact": (store.run_dir(run["id"]) / "global.pt").is_file(),
+        "partition_strategy": run.get("partition_strategy", PARTITION_PROPORTIONAL),
+        "seed": run.get("seed", 0),
+        "node_ids": run.get("node_ids"),
+        "suite_id": run.get("suite_id"),
+        "trial_id": run.get("trial_id"),
+        "map50": latest.get("map50") if latest else None,
+        "map50_95": latest.get("map50_95") if latest else None,
+        "best_map50": round(best, 5) if accuracy else None,
+        "accuracy_history": accuracy,
+        "eval_seconds_total": round(float(run.get("eval_seconds_total", 0.0)), 2),
+        "comm_bytes_total": int(run.get("comm_bytes_total", 0)),
+        "mean_imbalance": round(sum(imbalances) / len(imbalances), 4) if imbalances else None,
     }
 
 
@@ -1718,6 +1911,471 @@ def rescan(_: str = Depends(require_mesh_token)):
     pressed a button and expects the list to be current when it returns."""
     _scan_cache["running"] = True
     return _run_scan()
+
+
+# ---------------------------------------------------------------------------
+# Benchmark suites
+# ---------------------------------------------------------------------------
+
+BENCHMARK_DIR = store.STATE_DIR / "benchmarks"
+
+
+class SuiteRequest(BaseModel):
+    config: Dict[str, Any] = Field(default_factory=dict)
+
+
+def _suite_dir(suite_id: str) -> Path:
+    return BENCHMARK_DIR / suite_id
+
+
+def _ranked_nodes() -> List[dict]:
+    """Active, training-capable machines, strongest first."""
+    policy = current_policy()
+    with state_lock:
+        _refresh_liveness(time.time())
+        pool = [
+            dict(node)
+            for node in nodes.values()
+            if node.get("active") and node.get("supports_training", True)
+        ]
+    if not pool:
+        return []
+    mesh = mesh_reference(pool)
+    return sorted(pool, key=lambda node: fitness(node, mesh, policy), reverse=True)
+
+
+def _ensure_subset(parent: dict, sample_count: int) -> dict:
+    """Find or create the dataset subset of this size.
+
+    Subsets are cached by parent and size, so a sweep that visits 1000 images in
+    thirty different cells builds the manifest once. Reusing it also means every
+    one of those cells trains on exactly the same images, which is required for
+    the comparison to be about node count rather than about data.
+    """
+    if sample_count >= int(parent.get("train_count") or 0):
+        return parent
+
+    subset_id = "%s-n%d" % (parent["id"], sample_count)
+    existing = store.get_dataset(subset_id)
+    if existing and Path(existing.get("manifest_path") or "").is_file():
+        return existing
+
+    root = Path(parent["extracted_path"])
+    manifest_path = store.dataset_dir(parent["id"]) / ("subset_%d.txt" % sample_count)
+    info = sharding.write_subset_manifest(root, manifest_path, sample_count, seed=1234)
+
+    record = {
+        "id": subset_id,
+        "name": "%s (%d images)" % (parent["name"], info["train_count"]),
+        "filename": parent.get("filename"),
+        "created_at": time.time(),
+        "bytes": 0,
+        "train_count": info["train_count"],
+        "val_count": info["val_count"],
+        "class_names": parent.get("class_names") or ["object"],
+        "extracted_path": parent["extracted_path"],
+        "archive_path": parent.get("archive_path"),
+        "manifest_path": info["manifest_path"],
+        "parent_id": parent["id"],
+        "subset_seed": info["seed"],
+        "is_subset": True,
+    }
+    store.put_dataset(record)
+    emit("dataset.subset", {"id": subset_id, "images": info["train_count"]})
+    return record
+
+
+def _wait_for_run(run_id: str, timeout_seconds: float) -> str:
+    """Block until a run reaches a terminal state. Returns the final status."""
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if active_suite["abort"]:
+            try:
+                stop_run(run_id)
+            except Exception:
+                pass
+            return "aborted"
+        with state_lock:
+            run = runs.get(run_id)
+            status = run["status"] if run else "missing"
+        if status in {"done", "failed", "stopped", "missing"}:
+            return status
+        time.sleep(2.0)
+
+    try:
+        stop_run(run_id)
+    except Exception:
+        pass
+    return "timeout"
+
+
+def _execute_suite(suite_id: str) -> None:
+    """Run every trial in order. Owns the sweep thread for its whole duration."""
+    directory = _suite_dir(suite_id)
+    suite = benchmark.read_suite(directory)
+    if suite is None:
+        return
+
+    config = benchmark.SuiteConfig.from_dict(suite.get("config"))
+    specs = [benchmark.TrialSpec(**{k: v for k, v in t.items() if k != "label"}) for t in suite["trials"]]
+    done_ids = {r["trial_id"] for r in suite.get("results", [])}
+
+    suite["status"] = "running"
+    suite["started_at"] = suite.get("started_at") or time.time()
+    benchmark.write_suite(directory, suite)
+    emit("suite.started", {"suite_id": suite_id, "trials": len(specs)})
+
+    for spec in specs:
+        if active_suite["abort"]:
+            break
+        if spec.trial_id in done_ids:
+            continue
+
+        suite["current_trial"] = spec.as_dict()
+        benchmark.write_suite(directory, suite)
+
+        ranked = _ranked_nodes()
+        if len(ranked) < spec.node_count:
+            result = benchmark.trial_result(
+                spec,
+                {},
+                benchmark.STATUS_SKIPPED,
+                "needs %d machines, only %d are online" % (spec.node_count, len(ranked)),
+            )
+            suite.setdefault("results", []).append(result)
+            benchmark.write_suite(directory, suite)
+            emit("suite.trial", {"suite_id": suite_id, "trial": spec.as_dict(), "status": "skipped"})
+            continue
+
+        spec.node_ids = benchmark.select_nodes(
+            ranked, spec.node_count, config.node_selection, seed=spec.repeat * 97 + spec.node_count
+        )
+
+        parent = store.get_dataset(config.parent_dataset_id) if config.parent_dataset_id else store.default_dataset()
+        if parent is None:
+            suite["status"] = "failed"
+            suite["error"] = "the parent dataset is gone"
+            benchmark.write_suite(directory, suite)
+            break
+
+        try:
+            dataset = _ensure_subset(parent, spec.sample_count)
+            spec.dataset_id = dataset["id"]
+        except Exception as exc:
+            suite.setdefault("results", []).append(
+                benchmark.trial_result(spec, {}, benchmark.STATUS_FAILED, "subset failed: %s" % exc)
+            )
+            benchmark.write_suite(directory, suite)
+            continue
+
+        emit(
+            "suite.trial",
+            {
+                "suite_id": suite_id,
+                "trial": spec.as_dict(),
+                "status": "starting",
+                "completed": len(suite.get("results", [])),
+                "total": len(specs),
+            },
+        )
+
+        try:
+            created = create_run(
+                CreateRunRequest(
+                    name="%s · %s" % (config.name, spec.label()),
+                    dataset_id=spec.dataset_id,
+                    base_model=config.base_model,
+                    rounds=config.rounds,
+                    imgsz=config.imgsz,
+                    batch_size=config.batch_size,
+                    mode="mesh",
+                    node_ids=spec.node_ids,
+                    partition_strategy=spec.strategy,
+                    evaluate=config.evaluate,
+                    seed=spec.seed,
+                    suite_id=suite_id,
+                    trial_id=spec.trial_id,
+                    notes=config.notes or None,
+                )
+            )
+            run_id = created["id"]
+        except HTTPException as exc:
+            suite.setdefault("results", []).append(
+                benchmark.trial_result(spec, {}, benchmark.STATUS_FAILED, str(exc.detail))
+            )
+            benchmark.write_suite(directory, suite)
+            continue
+        except Exception as exc:
+            suite.setdefault("results", []).append(
+                benchmark.trial_result(spec, {}, benchmark.STATUS_FAILED, "%s: %s" % (type(exc).__name__, exc))
+            )
+            benchmark.write_suite(directory, suite)
+            continue
+
+        final_status = _wait_for_run(run_id, config.trial_timeout_seconds)
+
+        with state_lock:
+            run_snapshot = dict(runs.get(run_id) or {})
+        if not run_snapshot:
+            archived = store.get_run(run_id)
+            run_snapshot = dict(archived) if archived else {"id": run_id}
+
+        status = (
+            benchmark.STATUS_DONE
+            if final_status == "done"
+            else benchmark.STATUS_ABORTED
+            if final_status == "aborted"
+            else benchmark.STATUS_FAILED
+        )
+        result = benchmark.trial_result(
+            spec,
+            run_snapshot,
+            status,
+            None if status == benchmark.STATUS_DONE else run_snapshot.get("error") or final_status,
+        )
+        result["network"] = _network_snapshot(spec.node_ids)
+        suite.setdefault("results", []).append(result)
+        suite["current_trial"] = None
+        benchmark.write_suite(directory, suite)
+
+        emit(
+            "suite.trial",
+            {
+                "suite_id": suite_id,
+                "trial": spec.as_dict(),
+                "status": status,
+                "speedup": result.get("speedup"),
+                "map50": result.get("map50"),
+                "completed": len(suite.get("results", [])),
+                "total": len(specs),
+            },
+        )
+
+        # Let GPUs settle and memory free before the next timing measurement.
+        time.sleep(config.settle_seconds)
+
+    suite["status"] = "aborted" if active_suite["abort"] else "done"
+    suite["finished_at"] = time.time()
+    suite["current_trial"] = None
+    suite["cells"] = benchmark.accuracy_delta(benchmark.aggregate_cells(suite.get("results", [])))
+    benchmark.write_suite(directory, suite)
+
+    with suite_lock:
+        active_suite["id"] = None
+        active_suite["abort"] = False
+
+    emit("suite.finished", {"suite_id": suite_id, "status": suite["status"]})
+
+
+def _network_snapshot(node_ids: Sequence[str]) -> dict:
+    """Observed network conditions during a trial.
+
+    Recorded rather than imposed. Shaping traffic needs administrator rights and
+    a different tool on every platform, so the harness measures what the network
+    actually did and labels the run, which is what lets results from lab
+    Ethernet and from a phone hotspot be compared afterwards.
+    """
+    with state_lock:
+        rows = [
+            {
+                "node_id": node_id,
+                "name": (nodes.get(node_id) or {}).get("display_name"),
+                "latency_ms": (nodes.get(node_id) or {}).get("latency_ms"),
+                "throughput_sps": (nodes.get(node_id) or {}).get("throughput_sps"),
+            }
+            for node_id in node_ids
+        ]
+    latencies = [r["latency_ms"] for r in rows if isinstance(r.get("latency_ms"), (int, float))]
+    return {
+        "nodes": rows,
+        "mean_latency_ms": round(sum(latencies) / len(latencies), 2) if latencies else None,
+        "max_latency_ms": round(max(latencies), 2) if latencies else None,
+    }
+
+
+@app.post("/benchmarks")
+def create_suite(req: SuiteRequest, _: str = Depends(require_mesh_token)):
+    """Plan a sweep and start it."""
+    with suite_lock:
+        if active_suite["id"]:
+            raise HTTPException(status_code=409, detail="A sweep is already running.")
+
+        config = benchmark.SuiteConfig.from_dict(req.config)
+        parent = (
+            store.get_dataset(config.parent_dataset_id)
+            if config.parent_dataset_id
+            else store.default_dataset()
+        )
+        if parent is None:
+            raise HTTPException(status_code=400, detail="Upload a dataset before running a sweep.")
+        if parent.get("is_subset"):
+            raise HTTPException(
+                status_code=400,
+                detail="Pick the full dataset, not a subset. The sweep derives its own subsets.",
+            )
+        if not aggregation.torch_ready():
+            raise HTTPException(status_code=503, detail="The training plane is still installing.")
+
+        ranked = _ranked_nodes()
+        if not ranked:
+            raise HTTPException(status_code=409, detail="No eligible machine is online.")
+
+        config.parent_dataset_id = parent["id"]
+        trials = benchmark.expand(config, len(ranked))
+        if not trials:
+            raise HTTPException(status_code=400, detail="That configuration produces no trials.")
+
+        best_throughput = max(
+            (float(node.get("throughput_sps") or 0.0) for node in ranked), default=0.0
+        )
+        suite_id = uuid.uuid4().hex[:12]
+        suite = {
+            "id": suite_id,
+            "created_at": time.time(),
+            "started_at": None,
+            "finished_at": None,
+            "status": "pending",
+            "config": config.as_dict(),
+            "trials": [spec.as_dict() for spec in trials],
+            "results": [],
+            "current_trial": None,
+            "cells": [],
+            "estimated_seconds": round(
+                benchmark.estimate_seconds(trials, config, best_throughput), 1
+            ),
+            # The disclosure block reviewers check before they check the numbers.
+            "environment": {
+                "coordinator": evaluation.host_snapshot(),
+                "dataset": {
+                    "id": parent["id"],
+                    "name": parent["name"],
+                    "train_count": parent.get("train_count"),
+                    "val_count": parent.get("val_count"),
+                    "class_names": parent.get("class_names"),
+                },
+                "policy": current_policy().as_dict(),
+                "nodes": [
+                    {
+                        "node_id": node["node_id"],
+                        "name": node.get("display_name"),
+                        "gpu": node.get("gpu"),
+                        "backend": node.get("backend"),
+                        "memory_mb": node.get("gpu_memory_mb"),
+                        "capability": node.get("capability"),
+                        "agent_version": node.get("agent_version"),
+                    }
+                    for node in ranked
+                ],
+            },
+        }
+        benchmark.write_suite(_suite_dir(suite_id), suite)
+        active_suite["id"] = suite_id
+        active_suite["abort"] = False
+
+    sweeper.submit(_execute_suite, suite_id)
+    emit("suite.created", {"suite_id": suite_id, "trials": len(trials)})
+    return suite
+
+
+@app.post("/benchmarks/preview")
+def preview_suite(req: SuiteRequest, _: str = Depends(require_mesh_token)):
+    """Trial count and rough duration for a configuration, before committing."""
+    config = benchmark.SuiteConfig.from_dict(req.config)
+    ranked = _ranked_nodes()
+    trials = benchmark.expand(config, max(1, len(ranked)))
+    best = max((float(n.get("throughput_sps") or 0.0) for n in ranked), default=0.0)
+    return {
+        "trials": len(trials),
+        "estimated_seconds": round(benchmark.estimate_seconds(trials, config, best), 1),
+        "available_nodes": len(ranked),
+        "breakdown": [spec.as_dict() for spec in trials[:60]],
+    }
+
+
+@app.get("/benchmarks")
+def get_suites(_: str = Depends(require_mesh_token)):
+    ranked = _ranked_nodes()
+    return {
+        "suites": benchmark.list_suites(BENCHMARK_DIR),
+        "active_suite_id": active_suite["id"],
+        "available_nodes": len(ranked),
+        "nodes": [
+            {
+                "node_id": node["node_id"],
+                "name": node.get("display_name"),
+                "gpu": node.get("gpu"),
+                "backend": node.get("backend"),
+                "memory_mb": node.get("gpu_memory_mb"),
+                "gflops": (node.get("capability") or {}).get("gflops"),
+                "throughput_sps": node.get("throughput_sps"),
+            }
+            for node in ranked
+        ],
+        "torch_ready": aggregation.torch_ready(),
+    }
+
+
+@app.get("/benchmarks/{suite_id}")
+def get_suite(suite_id: str, _: str = Depends(require_mesh_token)):
+    suite = benchmark.read_suite(_suite_dir(suite_id))
+    if suite is None:
+        raise HTTPException(status_code=404, detail="Unknown sweep")
+    suite["is_active"] = active_suite["id"] == suite_id
+    if suite.get("status") == "running" and not suite["is_active"]:
+        # The coordinator restarted while this sweep was mid-flight.
+        suite["status"] = "interrupted"
+    return suite
+
+
+@app.post("/benchmarks/{suite_id}/abort")
+def abort_suite(suite_id: str, _: str = Depends(require_mesh_token)):
+    with suite_lock:
+        if active_suite["id"] != suite_id:
+            raise HTTPException(status_code=409, detail="That sweep is not running.")
+        active_suite["abort"] = True
+    emit("suite.aborting", {"suite_id": suite_id})
+    return {"status": "aborting"}
+
+
+@app.post("/benchmarks/{suite_id}/resume")
+def resume_suite(suite_id: str, _: str = Depends(require_mesh_token)):
+    """Continue an interrupted sweep from the first trial without a result."""
+    with suite_lock:
+        if active_suite["id"]:
+            raise HTTPException(status_code=409, detail="A sweep is already running.")
+        suite = benchmark.read_suite(_suite_dir(suite_id))
+        if suite is None:
+            raise HTTPException(status_code=404, detail="Unknown sweep")
+        if suite.get("status") == "done":
+            raise HTTPException(status_code=409, detail="That sweep already finished.")
+        active_suite["id"] = suite_id
+        active_suite["abort"] = False
+    sweeper.submit(_execute_suite, suite_id)
+    return {"status": "resumed"}
+
+
+@app.delete("/benchmarks/{suite_id}")
+def delete_suite(suite_id: str, _: str = Depends(require_mesh_token)):
+    if active_suite["id"] == suite_id:
+        raise HTTPException(status_code=409, detail="Stop the sweep before deleting it.")
+    directory = _suite_dir(suite_id)
+    if not directory.is_dir():
+        raise HTTPException(status_code=404, detail="Unknown sweep")
+    shutil.rmtree(directory, ignore_errors=True)
+    return {"status": "deleted"}
+
+
+@app.get("/benchmarks/{suite_id}/download/{artifact}")
+def download_suite_artifact(suite_id: str, artifact: str, _: str = Depends(require_mesh_token)):
+    """suite.json, results.csv or summary.csv for one sweep."""
+    allowed = {"suite.json", "results.csv", "summary.csv"}
+    if artifact not in allowed:
+        raise HTTPException(status_code=404, detail="Unknown artifact")
+    path = _suite_dir(suite_id) / artifact
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Not generated yet")
+    media = "application/json" if artifact.endswith(".json") else "text/csv"
+    return FileResponse(path, media_type=media, filename="%s-%s" % (suite_id, artifact))
 
 
 @app.get("/health")

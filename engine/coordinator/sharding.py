@@ -15,7 +15,7 @@ import random
 import shutil
 import zipfile
 from pathlib import Path
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 from federated_training import (
     IMAGE_SUFFIXES,
@@ -25,14 +25,33 @@ from federated_training import (
 )
 
 
-def list_split_images(dataset_root: Path) -> Dict[str, Any]:
-    """Return the discovered split directories plus the sorted image lists."""
+def list_split_images(dataset_root: Path, manifest: Optional[Path] = None) -> Dict[str, Any]:
+    """Return the discovered split directories plus the sorted image lists.
+
+    A manifest restricts the training list to named files. That is how dataset
+    subsets work: a 1000-image subset of a 10000-image parent is a list of
+    filenames, not a second copy of the images on disk. Copying would make a
+    scaling sweep across 100, 1000 and 10000 images cost several times the
+    dataset in disk and minutes in setup, for no scientific gain.
+    """
     split_dirs = discover_yolo_split_dirs(dataset_root)
     train_images = sorted(
         path
         for path in split_dirs["train_images"].rglob("*")
         if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
     )
+
+    if manifest is not None and manifest.is_file():
+        wanted = {
+            line.strip()
+            for line in manifest.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        }
+        base = split_dirs["train_images"]
+        train_images = [
+            path for path in train_images if path.relative_to(base).as_posix() in wanted
+        ]
+
     val_images: List[Path] = []
     if split_dirs["val_images"] is not None:
         val_images = sorted(
@@ -43,8 +62,42 @@ def list_split_images(dataset_root: Path) -> Dict[str, Any]:
     return {"dirs": split_dirs, "train": train_images, "val": val_images}
 
 
-def count_training_samples(dataset_root: Path) -> int:
-    return len(list_split_images(dataset_root)["train"])
+def write_subset_manifest(
+    dataset_root: Path,
+    destination: Path,
+    sample_count: int,
+    seed: int = 0,
+) -> Dict[str, Any]:
+    """Choose a reproducible subset of the training split and record it.
+
+    The validation split is deliberately untouched. Every subset in a scaling
+    sweep is evaluated against exactly the same held-out images, otherwise a
+    change in measured accuracy could be a change in the test set rather than a
+    change in the training set, and the sweep would answer nothing.
+    """
+    listing = list_split_images(dataset_root)
+    base = listing["dirs"]["train_images"]
+    relative = [path.relative_to(base).as_posix() for path in listing["train"]]
+
+    if sample_count >= len(relative):
+        chosen = relative
+    else:
+        chosen = random.Random(seed).sample(relative, sample_count)
+
+    chosen.sort()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text("\n".join(chosen), encoding="utf-8")
+    return {
+        "manifest_path": str(destination),
+        "train_count": len(chosen),
+        "val_count": len(listing["val"]),
+        "parent_train_count": len(relative),
+        "seed": seed,
+    }
+
+
+def count_training_samples(dataset_root: Path, manifest: Optional[Path] = None) -> int:
+    return len(list_split_images(dataset_root, manifest=manifest)["train"])
 
 
 def partition(images: Sequence[Path], sizes: Sequence[int], seed: int) -> List[List[Path]]:
@@ -80,6 +133,7 @@ def build_proportional_shards(
     class_names: List[str],
     seed: int = 0,
     replicate_val: bool = True,
+    manifest: Optional[Path] = None,
 ) -> List[Dict[str, Any]]:
     """Materialise one zipped shard per entry in sizes.
 
@@ -90,7 +144,7 @@ def build_proportional_shards(
     if not sizes:
         raise ValueError("At least one shard size is required")
 
-    listing = list_split_images(dataset_root)
+    listing = list_split_images(dataset_root, manifest=manifest)
     split_dirs = listing["dirs"]
     train_images = listing["train"]
     val_images = listing["val"]

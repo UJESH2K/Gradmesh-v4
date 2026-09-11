@@ -372,6 +372,10 @@ def train_batch(batch: dict) -> dict:
                 "workers": 0,
                 "verbose": False,
             }
+            # The coordinator sets this per trial so repeated runs of the same
+            # configuration are not bit-identical. Absent, Ultralytics uses 0.
+            if batch.get("seed") is not None:
+                train_options["seed"] = int(batch["seed"])
             if ACCELERATOR.backend == "xpu":
                 from ultralytics_xpu import xpu_train
 

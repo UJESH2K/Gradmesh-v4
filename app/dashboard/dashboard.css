@@ -574,3 +574,81 @@
     grid-template-columns: 1fr;
   }
 }
+
+/* ------------------------------------------------------------- testing lab */
+
+.lab-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+
+@media (max-width: 1180px) {
+  .lab-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Toggles for machine counts and partitioning arms. Buttons rather than
+   checkboxes because the set is small and the state has to be readable at a
+   glance while a sweep is being designed. */
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.chip {
+  padding: 6px 13px;
+  border-radius: 999px;
+  border: 1px solid var(--line-strong);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text-dim);
+  font-size: 0.82rem;
+  cursor: pointer;
+  transition: all 140ms ease;
+}
+
+.chip:hover {
+  color: var(--text);
+  border-color: rgba(255, 255, 255, 0.24);
+}
+
+.chip.is-on {
+  background: rgba(91, 124, 250, 0.14);
+  border-color: rgba(91, 124, 250, 0.5);
+  color: var(--accent);
+}
+
+.suite-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.suite-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 13px 20px;
+  border: none;
+  border-bottom: 1px solid var(--line);
+  background: none;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+
+.suite-row:last-child {
+  border-bottom: none;
+}
+
+.suite-row:hover {
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.suite-row.is-open {
+  background: rgba(91, 124, 250, 0.08);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
