@@ -1,0 +1,20 @@
+# Normalise line endings so a Windows host and a Linux worker do not show every
+# file as modified, and so the "LF will be replaced by CRLF" warnings stop.
+* text=auto eol=lf
+
+# Scripts that must keep their platform's endings to stay executable.
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.sh  text eol=lf
+
+# Binary, never touched.
+*.pt      binary
+*.glb     binary
+*.png     binary
+*.jpg     binary
+*.jpeg    binary
+*.webp    binary
+*.pdf     binary
+*.zip     binary
+*.ico     binary
