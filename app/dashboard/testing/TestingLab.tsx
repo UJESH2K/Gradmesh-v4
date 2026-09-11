@@ -3,10 +3,13 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { useMesh } from "@/components/dashboard/MeshProvider";
+import { CampaignComparison, CampaignList, NetworkChangePrompt } from "./CampaignPanel";
+import DatasetImporter from "./DatasetImporter";
 import { Empty, Panel, StatTile } from "@/components/dashboard/ui";
 import { bytes, clock, compact, percent, seconds } from "@/lib/format";
 import type {
   BenchmarkIndex,
+  Campaign,
   Dataset,
   PartitionStrategy,
   Suite,
@@ -44,6 +47,8 @@ function defaultConfig(): SuiteConfig {
     notes: "",
     trial_timeout_seconds: 3600,
     settle_seconds: 6,
+    campaign_id: null,
+    leg: 1,
   };
 }
 
@@ -58,6 +63,7 @@ export default function TestingLab({ canManage }: { canManage: boolean }) {
   const [openSuiteId, setOpenSuiteId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [handoff, setHandoff] = useState<Suite | null>(null);
 
   const patch = (values: Partial<SuiteConfig>) => setConfig((current) => ({ ...current, ...values }));
 
@@ -72,19 +78,27 @@ export default function TestingLab({ canManage }: { canManage: boolean }) {
     }
   }, [request, openSuiteId]);
 
-  useEffect(() => {
-    void loadIndex();
-    request<{ datasets: Dataset[] }>("/api/mesh/datasets")
-      .then((payload) => {
+  const loadDatasets = useCallback(
+    async (selectNewest = false) => {
+      try {
+        const payload = await request<{ datasets: Dataset[] }>("/api/mesh/datasets");
         const parents = payload.datasets.filter((item) => !("is_subset" in item && item.is_subset));
         setDatasets(parents);
-        setConfig((current) =>
-          current.parent_dataset_id
-            ? current
-            : { ...current, parent_dataset_id: parents.find((d) => d.is_default)?.id ?? parents[0]?.id ?? null }
-        );
-      })
-      .catch(() => {});
+        setConfig((current) => {
+          if (!selectNewest && current.parent_dataset_id) return current;
+          const preferred = parents.find((d) => d.is_default) ?? parents[0];
+          return preferred ? { ...current, parent_dataset_id: preferred.id } : current;
+        });
+      } catch {
+        // The dataset list is not critical to rendering the page.
+      }
+    },
+    [request]
+  );
+
+  useEffect(() => {
+    void loadIndex();
+    void loadDatasets();
     // Intentionally once on mount; the stream drives refreshes after that.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -92,9 +106,19 @@ export default function TestingLab({ canManage }: { canManage: boolean }) {
   // A sweep publishes an event per trial, so the screen follows it without polling hard.
   useEffect(() => {
     const latest = events.at(-1);
-    if (latest && latest.kind.startsWith("suite.")) {
-      void loadIndex();
-      if (openSuiteId) void openSuite(openSuiteId);
+    if (!latest || !latest.kind.startsWith("suite.")) return;
+
+    void loadIndex();
+    if (openSuiteId) void openSuite(openSuiteId);
+
+    // A finished leg is the moment somebody has to go and change the network,
+    // so it opens the handoff prompt rather than waiting to be noticed.
+    if (latest.kind === "suite.finished" && latest.data.awaiting_network_change) {
+      const finishedId = String(latest.data.suite_id);
+      setOpenSuiteId(finishedId);
+      request<Suite>(`/api/mesh/benchmarks/${finishedId}`)
+        .then(setHandoff)
+        .catch(() => {});
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [events]);
@@ -141,16 +165,11 @@ export default function TestingLab({ canManage }: { canManage: boolean }) {
     };
   }, [config, request]);
 
-  async function start() {
+  async function abort() {
+    if (!openSuiteId) return;
     setBusy(true);
-    setError(null);
     try {
-      const created = await request<Suite>("/api/mesh/benchmarks", {
-        method: "POST",
-        body: JSON.stringify({ config }),
-      });
-      setOpenSuiteId(created.id);
-      await loadIndex();
+      await request(`/api/mesh/benchmarks/${openSuiteId}/abort`, { method: "POST" });
     } catch (cause) {
       setError((cause as Error).message);
     } finally {
@@ -158,11 +177,18 @@ export default function TestingLab({ canManage }: { canManage: boolean }) {
     }
   }
 
-  async function abort() {
-    if (!openSuiteId) return;
+  async function startNextLeg(networkLabel: string) {
+    if (!handoff) return;
     setBusy(true);
+    setError(null);
     try {
-      await request(`/api/mesh/benchmarks/${openSuiteId}/abort`, { method: "POST" });
+      const created = await request<Suite>(`/api/mesh/benchmarks/${handoff.id}/next-leg`, {
+        method: "POST",
+        body: JSON.stringify({ network_label: networkLabel }),
+      });
+      setHandoff(null);
+      setOpenSuiteId(created.id);
+      await loadIndex();
     } catch (cause) {
       setError((cause as Error).message);
     } finally {
@@ -185,6 +211,38 @@ export default function TestingLab({ canManage }: { canManage: boolean }) {
 
   const available = index?.available_nodes ?? 0;
   const running = Boolean(index?.active_suite_id);
+  const campaigns: Campaign[] = index?.campaigns ?? [];
+
+  /**
+   * Re-count the machines, then start.
+   *
+   * The count is re-read immediately before starting rather than trusted from
+   * the last poll, because the gap between opening this page and pressing the
+   * button is exactly when somebody plugs in one more laptop.
+   */
+  async function startTesting() {
+    setBusy(true);
+    setError(null);
+    try {
+      const fresh = await request<BenchmarkIndex>("/api/mesh/benchmarks");
+      setIndex(fresh);
+      if (fresh.available_nodes === 0) {
+        setError("No machine is online. Bring workers in from the Discover page first.");
+        return;
+      }
+      const created = await request<Suite>("/api/mesh/benchmarks", {
+        method: "POST",
+        body: JSON.stringify({ config }),
+      });
+      setHandoff(null);
+      setOpenSuiteId(created.id);
+      await loadIndex();
+    } catch (cause) {
+      setError((cause as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
 
   const parent = datasets.find((item) => item.id === config.parent_dataset_id) ?? null;
   const oversized = useMemo(
@@ -205,15 +263,35 @@ export default function TestingLab({ canManage }: { canManage: boolean }) {
         <div className="row" style={{ gap: 8 }}>
           {running ? (
             <button className="btn btn-sm btn-danger" onClick={abort} disabled={busy || !canManage}>
-              Stop sweep
+              Stop testing
             </button>
           ) : (
-            <button className="btn btn-primary btn-sm" onClick={start} disabled={busy || !canManage || available === 0}>
-              {busy ? "Starting…" : "Run the sweep"}
+            <button
+              className="btn btn-primary btn-lg"
+              onClick={startTesting}
+              disabled={busy || !canManage}
+              title={
+                available === 0
+                  ? "No machine is online yet"
+                  : `Detects machines, then runs ${preview?.trials ?? "the"} trials`
+              }
+            >
+              {busy
+                ? "Detecting machines…"
+                : `Start testing${preview ? ` · ${preview.trials} trials` : ""}`}
             </button>
           )}
         </div>
       </div>
+
+      {handoff ? (
+        <NetworkChangePrompt
+          suite={handoff}
+          onStartNextLeg={startNextLeg}
+          busy={busy}
+          nodesOnline={available}
+        />
+      ) : null}
 
       {error ? <div className="notice notice-danger">{error}</div> : null}
       {!canManage ? (
@@ -493,6 +571,14 @@ export default function TestingLab({ canManage }: { canManage: boolean }) {
             </div>
           </Panel>
 
+          <DatasetImporter canManage={canManage} onImported={() => void loadDatasets(true)} />
+
+          <CampaignList
+            campaigns={campaigns}
+            openSuiteId={openSuiteId}
+            onOpen={(id) => setOpenSuiteId(id)}
+          />
+
           <Panel title="Past sweeps" flush>
             {(index?.suites ?? []).length === 0 ? (
               <Empty>Nothing has been run yet.</Empty>
@@ -532,6 +618,14 @@ export default function TestingLab({ canManage }: { canManage: boolean }) {
           </Panel>
         </div>
       </div>
+
+      {suite?.config.campaign_id
+        ? campaigns
+            .filter((campaign) => campaign.campaign_id === suite.config.campaign_id)
+            .map((campaign) => (
+              <CampaignComparison key={campaign.campaign_id} campaign={campaign} />
+            ))
+        : null}
 
       {suite ? <SuiteView suite={suite} onResume={resume} canManage={canManage} busy={busy} /> : null}
     </>

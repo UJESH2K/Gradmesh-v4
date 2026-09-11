@@ -78,6 +78,12 @@ class SuiteConfig:
     # on lab Ethernet and on a phone hotspot stay distinguishable in the data.
     network_label: str = "unspecified"
     notes: str = ""
+    # Legs of one campaign share a campaign_id and an otherwise identical
+    # design, differing only in network_label. That is what makes "the same
+    # experiment on college Wi-Fi and on a phone hotspot" a controlled
+    # comparison rather than two unrelated sweeps.
+    campaign_id: Optional[str] = None
+    leg: int = 1
     # Stop a trial that has clearly hung rather than losing the rest of the day.
     trial_timeout_seconds: int = 3600
     settle_seconds: float = 6.0
@@ -480,6 +486,84 @@ def read_suite(directory: Path) -> Optional[dict]:
         return None
 
 
+def campaign_summary(suites: Sequence[dict]) -> List[dict]:
+    """Group sweeps into campaigns, newest first.
+
+    A campaign is only interesting once it has more than one leg, but a
+    single-leg campaign still appears so the next leg has something to attach
+    to.
+    """
+    grouped: Dict[str, List[dict]] = {}
+    for entry in suites:
+        campaign = entry.get("campaign_id")
+        if not campaign:
+            continue
+        grouped.setdefault(campaign, []).append(entry)
+
+    campaigns = []
+    for campaign_id, legs in grouped.items():
+        legs.sort(key=lambda item: item.get("leg") or 0)
+        campaigns.append(
+            {
+                "campaign_id": campaign_id,
+                "name": legs[0].get("name"),
+                "legs": legs,
+                "networks": [leg.get("network_label") for leg in legs],
+                "created_at": min((leg.get("created_at") or 0) for leg in legs),
+                "complete_legs": sum(1 for leg in legs if leg.get("status") == "done"),
+            }
+        )
+    campaigns.sort(key=lambda item: item["created_at"], reverse=True)
+    return campaigns
+
+
+def compare_networks(suites_with_results: Sequence[dict]) -> List[dict]:
+    """One row per network label, for the cross-network comparison table.
+
+    Averaged over every completed trial in that leg, which is the level the
+    question is actually asked at: does this mesh behave differently on a
+    different network. Per-cell detail stays in each leg's own results.
+    """
+    rows = []
+    for suite in suites_with_results:
+        results = [r for r in suite.get("results", []) if r.get("status") == STATUS_DONE]
+        if not results:
+            continue
+
+        annotated = annotate_baselines(results)
+        multi = [r for r in annotated if (r.get("node_count") or 1) > 1]
+
+        def mean_of(source, key):
+            values = [r[key] for r in source if isinstance(r.get(key), (int, float))]
+            return round(statistics.fmean(values), 5) if values else None
+
+        latencies = [
+            node.get("latency_ms")
+            for r in results
+            for node in (r.get("network") or {}).get("nodes", [])
+            if isinstance(node.get("latency_ms"), (int, float))
+        ]
+
+        rows.append(
+            {
+                "suite_id": suite.get("id"),
+                "leg": suite.get("config", {}).get("leg", 1),
+                "network_label": suite.get("config", {}).get("network_label"),
+                "trials": len(results),
+                "mean_latency_ms": round(statistics.fmean(latencies), 2) if latencies else None,
+                "train_seconds": mean_of(results, "train_seconds"),
+                "speedup": mean_of(multi, "speedup"),
+                "efficiency": mean_of(multi, "efficiency"),
+                "map50": mean_of(results, "map50"),
+                "comm_fraction": mean_of(results, "comm_fraction"),
+                "comm_bytes": mean_of(results, "comm_bytes"),
+                "imbalance": mean_of(multi, "mean_imbalance"),
+            }
+        )
+    rows.sort(key=lambda item: item["leg"])
+    return rows
+
+
 def list_suites(root: Path) -> List[dict]:
     """Lightweight index of every sweep on disk, newest first."""
     if not root.is_dir():
@@ -503,6 +587,8 @@ def list_suites(root: Path) -> List[dict]:
                 "completed_trials": sum(1 for r in results if r.get("status") == STATUS_DONE),
                 "failed_trials": sum(1 for r in results if r.get("status") == STATUS_FAILED),
                 "network_label": suite.get("config", {}).get("network_label"),
+                "campaign_id": suite.get("config", {}).get("campaign_id"),
+                "leg": suite.get("config", {}).get("leg", 1),
             }
         )
     entries.sort(key=lambda item: item.get("created_at") or 0, reverse=True)

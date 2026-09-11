@@ -49,7 +49,12 @@ def torch_device() -> str:
     return "cpu"
 
 
-def write_eval_yaml(dataset_root: Path, destination: Path, class_names: List[str]) -> Path:
+def write_eval_yaml(
+    dataset_root: Path,
+    destination: Path,
+    class_names: List[str],
+    splits: Optional[dict] = None,
+) -> Path:
     """A data.yaml whose val split is the full held-out set.
 
     Ultralytics needs a train key even for validation, so it points at the val
@@ -57,12 +62,18 @@ def write_eval_yaml(dataset_root: Path, destination: Path, class_names: List[str
     """
     from coordinator.sharding import list_split_images
 
-    listing = list_split_images(dataset_root)
+    listing = list_split_images(dataset_root, splits=splits)
     dirs = listing["dirs"]
     root = Path(dirs["root"]).resolve()
 
-    val_dir = dirs["val_images"] or dirs["train_images"]
-    val_relative = Path(val_dir).resolve().relative_to(root).as_posix()
+    val_dir = Path(dirs["val_images"] or dirs["train_images"]).resolve()
+    try:
+        val_relative = val_dir.relative_to(root).as_posix()
+    except ValueError:
+        # A standard dataset can place its splits outside the directory its own
+        # config calls the root. An absolute path is always valid here.
+        root = val_dir.parent
+        val_relative = val_dir.name
 
     names = class_names or ["object"]
     names_block = "\n".join("  %d: %s" % (index, name) for index, name in enumerate(names))

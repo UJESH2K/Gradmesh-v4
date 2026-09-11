@@ -25,16 +25,37 @@ from federated_training import (
 )
 
 
-def list_split_images(dataset_root: Path, manifest: Optional[Path] = None) -> Dict[str, Any]:
-    """Return the discovered split directories plus the sorted image lists.
+def list_split_images(
+    dataset_root: Path,
+    manifest: Optional[Path] = None,
+    splits: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Return the split directories plus the sorted image lists.
 
     A manifest restricts the training list to named files. That is how dataset
     subsets work: a 1000-image subset of a 10000-image parent is a list of
     filenames, not a second copy of the images on disk. Copying would make a
     scaling sweep across 100, 1000 and 10000 images cost several times the
     dataset in disk and minutes in setup, for no scientific gain.
+
+    `splits` supplies the four directories directly, skipping discovery. Uploaded
+    zips are found by directory name, but a standard dataset fetched through
+    Ultralytics puts its images somewhere like VisDrone2019-DET-train/images,
+    which no naming convention would guess. Its own config already names the
+    paths, so when the caller has them it passes them in rather than searching.
     """
-    split_dirs = discover_yolo_split_dirs(dataset_root)
+    if splits and splits.get("train_images"):
+        split_dirs = {
+            "root": Path(splits.get("root") or dataset_root),
+            "train_images": Path(splits["train_images"]),
+            "train_labels": Path(splits["train_labels"]) if splits.get("train_labels") else None,
+            "val_images": Path(splits["val_images"]) if splits.get("val_images") else None,
+            "val_labels": Path(splits["val_labels"]) if splits.get("val_labels") else None,
+        }
+        if split_dirs["train_labels"] is None:
+            raise ValueError("The training labels directory could not be resolved")
+    else:
+        split_dirs = discover_yolo_split_dirs(dataset_root)
     train_images = sorted(
         path
         for path in split_dirs["train_images"].rglob("*")
@@ -67,6 +88,7 @@ def write_subset_manifest(
     destination: Path,
     sample_count: int,
     seed: int = 0,
+    splits: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Choose a reproducible subset of the training split and record it.
 
@@ -75,7 +97,7 @@ def write_subset_manifest(
     change in measured accuracy could be a change in the test set rather than a
     change in the training set, and the sweep would answer nothing.
     """
-    listing = list_split_images(dataset_root)
+    listing = list_split_images(dataset_root, splits=splits)
     base = listing["dirs"]["train_images"]
     relative = [path.relative_to(base).as_posix() for path in listing["train"]]
 
@@ -96,8 +118,12 @@ def write_subset_manifest(
     }
 
 
-def count_training_samples(dataset_root: Path, manifest: Optional[Path] = None) -> int:
-    return len(list_split_images(dataset_root, manifest=manifest)["train"])
+def count_training_samples(
+    dataset_root: Path,
+    manifest: Optional[Path] = None,
+    splits: Optional[Dict[str, Any]] = None,
+) -> int:
+    return len(list_split_images(dataset_root, manifest=manifest, splits=splits)["train"])
 
 
 def partition(images: Sequence[Path], sizes: Sequence[int], seed: int) -> List[List[Path]]:
@@ -134,6 +160,7 @@ def build_proportional_shards(
     seed: int = 0,
     replicate_val: bool = True,
     manifest: Optional[Path] = None,
+    splits: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Materialise one zipped shard per entry in sizes.
 
@@ -144,7 +171,7 @@ def build_proportional_shards(
     if not sizes:
         raise ValueError("At least one shard size is required")
 
-    listing = list_split_images(dataset_root, manifest=manifest)
+    listing = list_split_images(dataset_root, manifest=manifest, splits=splits)
     split_dirs = listing["dirs"]
     train_images = listing["train"]
     val_images = listing["val"]

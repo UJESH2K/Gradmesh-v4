@@ -64,11 +64,80 @@ Efficiency is `speedup / machines`, from the first definition.
 
 ---
 
+## Running the same experiment on several networks
+
+This is what the **campaign** flow is for, and it is the cleanest network result
+you can get without administrator rights on every machine.
+
+1. Run a sweep with a network label, say `college-wifi`.
+2. When it finishes, the lab raises a **Change the network now** prompt. It says
+   what finished, how many machines are back online, and will not let the next
+   leg start under the same label.
+3. Move every machine onto the next network. Workers reconnect on their own and
+   `gradmesh.local` follows the host, so usually nothing needs retyping.
+4. Name the new network and press **Start leg 2**.
+
+The second leg copies the first leg's design exactly: same machines, same
+dataset, same subsets, same seeds, same matrix. Only `network_label` changes.
+That is what makes the two legs comparable, and it is why the next leg is started
+from the finished one rather than configured again from scratch.
+
+A cross-network table then appears with one row per leg: observed latency,
+training time, speedup, mAP and communication share, plus each leg's change
+against leg 1. Per-cell detail stays in each leg's own results, and
+`npm run report <leg-id>` builds the figures for one leg.
+
+A missing machine after a network change makes its cells **skipped**, not run
+smaller. A three-machine cell quietly run on two would silently break the
+comparison the campaign exists to make.
+
+### Getting a browser notification
+
+The prompt is an in-page banner, which always works. A desktop notification is
+attempted as well, but browsers only allow those on a secure origin, so it fires
+when you are on the host at `localhost` and not when you are on a LAN address.
+Do not rely on it.
+
 ## Where to get datasets
 
 You need **one dataset large enough to subsample**, not three different ones. The
 harness derives 100, 1000 and 10000-image subsets from a single parent, which is
 what keeps the comparison valid.
+
+### The quickest route: import a standard one
+
+**Testing parameters → Standard datasets → Browse** fetches a known dataset and
+registers it, no zip and no conversion. The catalogue is deliberately short:
+
+| Dataset | Images | Download | Use it for |
+|---|---|---|---|
+| COCO8 | 8 | 1 MB | proving the pipeline runs |
+| COCO128 | 128 | 7 MB | iterating on the harness |
+| African Wildlife | 1,052 | 100 MB | a sensible first real sweep |
+| Global Wheat 2020 | 3,422 | 700 MB | up to 3000 images, one class |
+| VisDrone2019-DET | 6,471 | 2.3 GB | the full scaling ladder |
+| COCO 2017 | 118,287 | 20 GB | a headline result with published baselines |
+| DOTA v1 | 1,411 | 2 GB | oriented boxes, needs a `-obb` model |
+
+**VisDrone** is the best default here. It covers a 100 to 6000 image ladder in
+one download and has ten classes with many small objects, so the task is hard
+enough that accuracy differences are visible.
+
+### Why not ImageNet
+
+ImageNet is a **classification** dataset. The 1.28M-image ILSVRC subset has one
+label per image and no bounding boxes, so a detection model has nothing to learn
+from and there is nothing to convert. The ILSVRC **detection** subset does have
+boxes across 200 classes, but it is roughly 150 GB, ships VOC-style XML that
+needs converting to YOLO text files, and sits behind a login and a signed
+agreement, so it cannot be fetched by a script.
+
+COCO is the dataset that plays the role people usually want ImageNet for here:
+standard, citable, boxes included, and with published YOLO baselines to compare
+against. Use COCO if you want the recognisable name, VisDrone if you want the
+experiment to finish this week.
+
+### Bring your own
 
 **Roboflow Universe** (`universe.roboflow.com`) is the fastest route. Filter for
 object detection, pick a dataset with at least 10000 images, and export in

@@ -90,10 +90,12 @@ async function requirePorts() {
   if (conflicts.length === 0) return;
 
   const list = conflicts.join(" and ");
+  const plural = conflicts.length > 1;
   console.error(
     paint(
       "red",
-      `\nPort ${list} is already in use, most likely by a GradMesh that is still running.\n`
+      `\n${plural ? "Ports" : "Port"} ${list} ${plural ? "are" : "is"} already in use, ` +
+        "most likely a GradMesh that is still running.\n"
     )
   );
   console.error(

@@ -29,6 +29,7 @@ import os
 import shutil
 import sys
 import time
+import traceback
 import uuid
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -47,7 +48,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from coordinator import aggregation, benchmark, discovery, evaluation, sharding, store
+from coordinator import (
+    aggregation,
+    benchmark,
+    datasets_std,
+    discovery,
+    evaluation,
+    sharding,
+    store,
+)
 from coordinator.events import bus
 
 from coordinator.scheduler import (
@@ -80,6 +89,11 @@ SUPERVISOR_INTERVAL_SECONDS = 2.0
 # Multiples of the heartbeat timeout after which a silent node is dropped from
 # the registry entirely rather than shown as an offline member forever.
 NODE_EVICTION_MULTIPLE = 15
+# A run that is nominally running but has no shard in flight is between rounds.
+# That gap should last milliseconds. If it lasts this long, something went wrong
+# that nobody reported, and the watchdog steps in.
+STALL_GRACE_SECONDS = 90.0
+MAX_STALL_RECOVERIES = 2
 MAX_ROUND_ATTEMPTS = 2
 
 # ---------------------------------------------------------------------------
@@ -115,6 +129,40 @@ advertiser = discovery.MulticastAdvertiser(
 
 _scan_cache: Dict[str, Any] = {"result": None, "at": 0.0, "running": False}
 SCAN_CACHE_SECONDS = 25.0
+
+
+def supervise(future, label: str, on_error=None):
+    """Surface exceptions raised on a background thread.
+
+    ThreadPoolExecutor stores an exception on the Future and never raises it, so
+    a submit whose result nobody inspects fails in total silence. That is
+    exactly what happened in the field: aggregation finished a round, the call
+    that planned the next one raised, and the dashboard sat on "planning the
+    next round" forever with no error anywhere, in the log or on screen.
+
+    Every submit now routes through here, so a failure is printed with its
+    traceback, published to the event stream, and handed to a callback that can
+    mark the affected run or sweep failed rather than leaving it hanging.
+    """
+
+    def done(settled):
+        try:
+            settled.result()
+        except Exception as exc:  # noqa: BLE001 - the whole point is to catch everything
+            detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            print("[gradmesh] %s failed:\n%s" % (label, detail), flush=True)
+            emit(
+                "internal.error",
+                {"where": label, "error": "%s: %s" % (type(exc).__name__, exc)},
+            )
+            if on_error is not None:
+                try:
+                    on_error(exc)
+                except Exception:
+                    print("[gradmesh] %s error handler failed" % label, flush=True)
+
+    future.add_done_callback(done)
+    return future
 
 
 def current_policy() -> MeshPolicy:
@@ -647,9 +695,10 @@ def create_run(req: CreateRunRequest, _: str = Depends(require_mesh_token)):
 
     manifest = dataset.get("manifest_path")
     dataset_root = Path(dataset["extracted_path"])
+    dataset_splits = dataset.get("splits")
     try:
         total_samples = sharding.count_training_samples(
-            dataset_root, Path(manifest) if manifest else None
+            dataset_root, Path(manifest) if manifest else None, splits=dataset_splits
         )
     except Exception:
         total_samples = int(dataset.get("train_count") or 0)
@@ -670,6 +719,7 @@ def create_run(req: CreateRunRequest, _: str = Depends(require_mesh_token)):
         "total_samples": total_samples,
         "dataset_manifest": manifest,
         "dataset_root": str(dataset_root),
+        "dataset_splits": dataset_splits,
         "node_ids": req.node_ids,
         "partition_strategy": req.partition_strategy,
         "seed": int(req.seed),
@@ -871,6 +921,7 @@ def _start_round(run_id: str) -> None:
         run["class_names"],
         seed=round_index + int(run.get("seed") or 0) * 1009,
         manifest=Path(run_manifest) if run_manifest else None,
+        splits=run.get("dataset_splits"),
     )
     _prune_old_rounds(run_id, round_index)
 
@@ -926,6 +977,7 @@ def _start_round(run_id: str) -> None:
         run["shards"] = shards
         run["shard_sizes"] = sizes
         run["round_started_at"] = now
+        run["last_progress_at"] = now
         for batch in created:
             batches[batch["batch_id"]] = batch
 
@@ -1032,7 +1084,11 @@ def _maybe_close_round(run_id: str) -> None:
         )
         return
 
-    aggregator.submit(_aggregate_round, run_id, round_index)
+    supervise(
+        aggregator.submit(_aggregate_round, run_id, round_index),
+        "aggregation of run %s round %d" % (run_id, round_index),
+        lambda exc: _fail_run(run_id, "aggregation failed: %s: %s" % (type(exc).__name__, exc)),
+    )
 
 
 def _unique_by_shard(items: List[dict]) -> List[dict]:
@@ -1069,12 +1125,21 @@ def _fail_round(run_id: str, reason: str) -> None:
     _archive_run(run_id)
 
 
-def _clear_round(run_id: str) -> None:
+def _clear_round(run_id: str, round_index: Optional[int] = None) -> None:
+    """Drop the batches belonging to one finished round.
+
+    The round must be named explicitly. This used to read run["current_round"],
+    but aggregation increments that *before* clearing, so it deleted the round
+    about to start, which was empty, and left the finished round's batches in
+    memory forever. Every later round then re-scanned them, and a long sweep
+    accumulated batches without bound.
+    """
     with state_lock:
         run = runs.get(run_id)
         if run is None:
             return
-        for batch_id in [b["batch_id"] for b in _round_batches(run_id, run["current_round"])]:
+        target = run["current_round"] if round_index is None else round_index
+        for batch_id in [b["batch_id"] for b in _round_batches(run_id, target)]:
             batches.pop(batch_id, None)
 
 
@@ -1201,6 +1266,7 @@ def _aggregate_round(run_id: str, round_index: int) -> None:
                 }
             )
         run["round_history"].append(record)
+        run["last_progress_at"] = time.time()
         run["current_round"] = round_index + 1
         run["round_attempts"] = 0
         run["closing"] = False
@@ -1209,7 +1275,7 @@ def _aggregate_round(run_id: str, round_index: int) -> None:
             run["status"] = "done"
             run["finished_at"] = time.time()
 
-    _clear_round(run_id)
+    _clear_round(run_id, round_index)
     _write_artifact(run_id, encoded)
     emit("round.completed", {"run_id": run_id, **record})
 
@@ -1231,13 +1297,16 @@ def _evaluate_round(run_id: str, encoded_weights: str, round_index: int) -> Opti
         if run is None or not run.get("evaluate"):
             return None
         dataset_root = Path(run["dataset_root"])
+        dataset_splits = run.get("dataset_splits")
         class_names = run["class_names"]
         imgsz = run["imgsz"]
         base_model = run["base_model"]
 
     try:
         workdir = store.run_dir(run_id) / "eval"
-        eval_yaml = evaluation.write_eval_yaml(dataset_root, workdir / "eval.yaml", class_names)
+        eval_yaml = evaluation.write_eval_yaml(
+            dataset_root, workdir / "eval.yaml", class_names, splits=dataset_splits
+        )
         result = evaluation.evaluate_weights(
             weights_b64=encoded_weights,
             base_model_path=store.MODELS_DIR / base_model,
@@ -1260,6 +1329,42 @@ def _evaluate_round(run_id: str, encoded_weights: str, round_index: int) -> Opti
         },
     )
     return result
+
+
+def _fail_run(run_id: str, reason: str) -> None:
+    """Mark a run failed from outside the round machinery."""
+    with state_lock:
+        run = runs.get(run_id)
+        if run is None or run["status"] in {"done", "failed", "stopped"}:
+            return
+        run["status"] = "failed"
+        run["error"] = reason
+        run["finished_at"] = time.time()
+        run["closing"] = False
+        for batch in batches.values():
+            if batch["run_id"] == run_id and batch["status"] in {"queued", "assigned"}:
+                batch["status"] = "dropped"
+                batch["error"] = reason
+    emit("run.failed", {"run_id": run_id, "error": reason})
+    _archive_run(run_id)
+
+
+def _fail_suite(suite_id: str, reason: str) -> None:
+    """Mark a sweep failed and release the slot, so the next one can start."""
+    try:
+        suite = benchmark.read_suite(_suite_dir(suite_id))
+        if suite is not None:
+            suite["status"] = "failed"
+            suite["error"] = reason
+            suite["finished_at"] = time.time()
+            suite["current_trial"] = None
+            benchmark.write_suite(_suite_dir(suite_id), suite)
+    finally:
+        with suite_lock:
+            if active_suite["id"] == suite_id:
+                active_suite["id"] = None
+                active_suite["abort"] = False
+    emit("suite.finished", {"suite_id": suite_id, "status": "failed", "error": reason})
 
 
 def _write_artifact(run_id: str, encoded_weights: str) -> None:
@@ -1394,6 +1499,7 @@ def _supervise_once() -> None:
     policy = current_policy()
     to_close: List[str] = []
     to_start: List[str] = []
+    to_fail: List[tuple] = []
 
     with state_lock:
         _refresh_liveness(now)
@@ -1522,15 +1628,153 @@ def _supervise_once() -> None:
             if run["status"] == "waiting" and idle_nodes:
                 to_start.append(run["id"])
 
+        # Watchdog for the gap between rounds.
+        #
+        # A run reported "running" with nothing in flight is supposed to be
+        # mid-handover, which takes milliseconds. One was observed sitting there
+        # indefinitely: a round finished, the call that plans the next one
+        # failed, and because nothing inspected that thread's Future the error
+        # was never reported. The dashboard showed "planning the next round"
+        # forever. Exceptions are surfaced now, but a stuck run should recover
+        # rather than rely on somebody reading a log, so this re-plans it and
+        # gives up loudly if re-planning does not take.
+        for run in runs.values():
+            if run["status"] != "running" or run.get("closing"):
+                continue
+            if any(
+                batch["run_id"] == run["id"] and batch["status"] in {"queued", "assigned"}
+                for batch in batches.values()
+            ):
+                continue
+            idle_for = now - float(run.get("last_progress_at") or now)
+            if idle_for < STALL_GRACE_SECONDS:
+                continue
+
+            recoveries = int(run.get("stall_recoveries", 0))
+            if recoveries >= MAX_STALL_RECOVERIES:
+                to_fail.append(
+                    (
+                        run["id"],
+                        "stalled between rounds for %.0fs and did not recover after %d attempts"
+                        % (idle_for, recoveries),
+                    )
+                )
+                continue
+
+            run["stall_recoveries"] = recoveries + 1
+            run["last_progress_at"] = now
+            emit(
+                "run.stalled",
+                {
+                    "run_id": run["id"],
+                    "round": run["current_round"],
+                    "idle_seconds": round(idle_for, 1),
+                    "attempt": recoveries + 1,
+                },
+            )
+            to_start.append(run["id"])
+
     for run_id in dict.fromkeys(to_close):
         _maybe_close_round(run_id)
     for run_id in dict.fromkeys(to_start):
-        _start_round(run_id)
+        # A failure here must not kill the supervisor loop, which everything
+        # else depends on.
+        try:
+            _start_round(run_id)
+        except Exception as exc:
+            _fail_run(run_id, "could not plan the next round: %s: %s" % (type(exc).__name__, exc))
+    for run_id, reason in to_fail:
+        _fail_run(run_id, reason)
 
 
 # ---------------------------------------------------------------------------
 # Datasets
 # ---------------------------------------------------------------------------
+
+
+class ImportDatasetRequest(BaseModel):
+    key: str = Field(..., min_length=1, max_length=60)
+    make_default: bool = True
+
+
+_import_state: Dict[str, Any] = {"running": False, "key": None, "message": None, "error": None}
+
+
+def _import_standard(key: str, make_default: bool) -> None:
+    """Fetch a catalogue dataset and register it. Runs on the sweep thread."""
+
+    def progress(message: str) -> None:
+        _import_state["message"] = message
+        emit("dataset.importing", {"key": key, "message": message})
+
+    try:
+        resolved = datasets_std.download(key, progress=progress)
+        splits = {
+            "root": resolved["root"],
+            "train_images": resolved["train_images"],
+            "train_labels": resolved["train_labels"],
+            "val_images": resolved["val_images"],
+            "val_labels": resolved["val_labels"],
+        }
+        listing = sharding.list_split_images(Path(resolved["root"]), splits=splits)
+
+        record = {
+            "id": "std-%s" % key.lower().replace(".", "-"),
+            "name": resolved["name"],
+            "filename": "%s.yaml" % key,
+            "created_at": time.time(),
+            "bytes": 0,
+            "train_count": len(listing["train"]),
+            "val_count": len(listing["val"]),
+            "class_names": resolved["class_names"],
+            "extracted_path": resolved["root"],
+            "archive_path": None,
+            "splits": splits,
+            "source": "standard",
+            "standard_key": key,
+        }
+        store.put_dataset(record, make_default=make_default)
+        _import_state.update({"message": "Imported %s" % resolved["name"], "error": None})
+        emit(
+            "dataset.added",
+            {"id": record["id"], "name": record["name"], "images": record["train_count"]},
+        )
+    except Exception as exc:
+        _import_state["error"] = "%s: %s" % (type(exc).__name__, exc)
+        emit("dataset.import_failed", {"key": key, "error": _import_state["error"]})
+    finally:
+        _import_state["running"] = False
+        _import_state["key"] = None
+
+
+@app.get("/datasets/standard")
+def list_standard_datasets(_: str = Depends(require_mesh_token)):
+    return {"catalogue": datasets_std.catalogue(), "import": dict(_import_state)}
+
+
+@app.post("/datasets/standard")
+def import_standard_dataset(req: ImportDatasetRequest, _: str = Depends(require_mesh_token)):
+    """Download a standard dataset and register it.
+
+    A 20 GB download cannot block an HTTP request, so this returns immediately
+    and reports progress through the event stream.
+    """
+    if req.key not in datasets_std.CATALOGUE_BY_KEY:
+        raise HTTPException(status_code=404, detail="Unknown dataset %r" % req.key)
+    if not aggregation.torch_ready():
+        raise HTTPException(status_code=503, detail="The training plane is still installing.")
+    if _import_state["running"]:
+        raise HTTPException(status_code=409, detail="Another import is already running.")
+    if active_suite["id"]:
+        raise HTTPException(status_code=409, detail="Finish or stop the running sweep first.")
+
+    _import_state.update({"running": True, "key": req.key, "message": "Starting", "error": None})
+    supervise(
+        sweeper.submit(_import_standard, req.key, req.make_default),
+        "import of %s" % req.key,
+        lambda exc: _import_state.update({"running": False, "error": str(exc)}),
+    )
+    return {"status": "importing", "key": req.key}
 
 
 @app.get("/datasets")
@@ -1850,7 +2094,7 @@ def discover(refresh: bool = Query(default=False), _: str = Depends(require_mesh
             # rather than being handed an empty page.
             cached = _run_scan()
         else:
-            scanner.submit(_run_scan)
+            supervise(scanner.submit(_run_scan), "network scan")
 
     with state_lock:
         _refresh_liveness(now)
@@ -1962,7 +2206,9 @@ def _ensure_subset(parent: dict, sample_count: int) -> dict:
 
     root = Path(parent["extracted_path"])
     manifest_path = store.dataset_dir(parent["id"]) / ("subset_%d.txt" % sample_count)
-    info = sharding.write_subset_manifest(root, manifest_path, sample_count, seed=1234)
+    info = sharding.write_subset_manifest(
+        root, manifest_path, sample_count, seed=1234, splits=parent.get("splits")
+    )
 
     record = {
         "id": subset_id,
@@ -1976,6 +2222,7 @@ def _ensure_subset(parent: dict, sample_count: int) -> dict:
         "extracted_path": parent["extracted_path"],
         "archive_path": parent.get("archive_path"),
         "manifest_path": info["manifest_path"],
+        "splits": parent.get("splits"),
         "parent_id": parent["id"],
         "subset_seed": info["seed"],
         "is_subset": True,
@@ -2164,7 +2411,21 @@ def _execute_suite(suite_id: str) -> None:
         active_suite["id"] = None
         active_suite["abort"] = False
 
-    emit("suite.finished", {"suite_id": suite_id, "status": suite["status"]})
+    results = suite.get("results", [])
+    emit(
+        "suite.finished",
+        {
+            "suite_id": suite_id,
+            "status": suite["status"],
+            "campaign_id": config.campaign_id,
+            "leg": config.leg,
+            "network_label": config.network_label,
+            "completed": sum(1 for r in results if r.get("status") == benchmark.STATUS_DONE),
+            "total": len(specs),
+            # The dashboard raises the "change the network now" prompt on this.
+            "awaiting_network_change": suite["status"] == "done" and bool(config.campaign_id),
+        },
+    )
 
 
 def _network_snapshot(node_ids: Sequence[str]) -> dict:
@@ -2221,6 +2482,8 @@ def create_suite(req: SuiteRequest, _: str = Depends(require_mesh_token)):
             raise HTTPException(status_code=409, detail="No eligible machine is online.")
 
         config.parent_dataset_id = parent["id"]
+        if not config.campaign_id:
+            config.campaign_id = uuid.uuid4().hex[:10]
         trials = benchmark.expand(config, len(ranked))
         if not trials:
             raise HTTPException(status_code=400, detail="That configuration produces no trials.")
@@ -2272,7 +2535,11 @@ def create_suite(req: SuiteRequest, _: str = Depends(require_mesh_token)):
         active_suite["id"] = suite_id
         active_suite["abort"] = False
 
-    sweeper.submit(_execute_suite, suite_id)
+    supervise(
+        sweeper.submit(_execute_suite, suite_id),
+        "sweep %s" % suite_id,
+        lambda exc: _fail_suite(suite_id, "%s: %s" % (type(exc).__name__, exc)),
+    )
     emit("suite.created", {"suite_id": suite_id, "trials": len(trials)})
     return suite
 
@@ -2292,11 +2559,124 @@ def preview_suite(req: SuiteRequest, _: str = Depends(require_mesh_token)):
     }
 
 
+class NextLegRequest(BaseModel):
+    network_label: str = Field(..., min_length=1, max_length=60)
+    notes: Optional[str] = None
+
+
+@app.get("/benchmarks/campaigns")
+def get_campaigns(_: str = Depends(require_mesh_token)):
+    """Sweeps grouped into campaigns, with a cross-network comparison per campaign."""
+    index = benchmark.list_suites(BENCHMARK_DIR)
+    campaigns = benchmark.campaign_summary(index)
+
+    for campaign in campaigns:
+        loaded = []
+        for leg in campaign["legs"]:
+            suite = benchmark.read_suite(_suite_dir(leg["id"]))
+            if suite:
+                loaded.append(suite)
+        campaign["comparison"] = benchmark.compare_networks(loaded)
+    return {"campaigns": campaigns, "active_suite_id": active_suite["id"]}
+
+
+@app.post("/benchmarks/{suite_id}/next-leg")
+def start_next_leg(suite_id: str, req: NextLegRequest, _: str = Depends(require_mesh_token)):
+    """Repeat a finished sweep's exact design on a different network.
+
+    The whole design is copied and only the network label changes, which is what
+    makes the two legs comparable. Machine count is re-checked at start, because
+    switching networks is exactly when a machine tends to fall off.
+    """
+    with suite_lock:
+        if active_suite["id"]:
+            raise HTTPException(status_code=409, detail="A sweep is already running.")
+
+        previous = benchmark.read_suite(_suite_dir(suite_id))
+        if previous is None:
+            raise HTTPException(status_code=404, detail="Unknown sweep")
+
+        config = benchmark.SuiteConfig.from_dict(previous.get("config"))
+        config.campaign_id = config.campaign_id or uuid.uuid4().hex[:10]
+        config.leg = int(config.leg or 1) + 1
+        config.network_label = req.network_label.strip()
+        if req.notes:
+            config.notes = req.notes
+
+        parent = store.get_dataset(config.parent_dataset_id)
+        if parent is None:
+            raise HTTPException(status_code=400, detail="The dataset from the previous leg is gone.")
+
+        ranked = _ranked_nodes()
+        if not ranked:
+            raise HTTPException(
+                status_code=409,
+                detail="No machine is online. Reconnect the workers to the new network first.",
+            )
+
+        # The design is fixed by the previous leg, so an explicit machine-count
+        # list carries over. If fewer machines came back after the network
+        # change, the missing cells are recorded as skipped rather than quietly
+        # run smaller, which would make the legs incomparable.
+        trials = benchmark.expand(config, max(len(ranked), max(config.node_counts or [1])))
+        if not trials:
+            raise HTTPException(status_code=400, detail="That design produces no trials.")
+
+        new_id = uuid.uuid4().hex[:12]
+        suite = {
+            "id": new_id,
+            "created_at": time.time(),
+            "started_at": None,
+            "finished_at": None,
+            "status": "pending",
+            "config": config.as_dict(),
+            "trials": [spec.as_dict() for spec in trials],
+            "results": [],
+            "current_trial": None,
+            "cells": [],
+            "estimated_seconds": previous.get("estimated_seconds"),
+            "previous_leg_id": suite_id,
+            "environment": {
+                "coordinator": evaluation.host_snapshot(),
+                "dataset": previous.get("environment", {}).get("dataset"),
+                "policy": current_policy().as_dict(),
+                "nodes": [
+                    {
+                        "node_id": node["node_id"],
+                        "name": node.get("display_name"),
+                        "gpu": node.get("gpu"),
+                        "backend": node.get("backend"),
+                        "memory_mb": node.get("gpu_memory_mb"),
+                        "capability": node.get("capability"),
+                        "agent_version": node.get("agent_version"),
+                    }
+                    for node in ranked
+                ],
+            },
+        }
+        benchmark.write_suite(_suite_dir(new_id), suite)
+        active_suite["id"] = new_id
+        active_suite["abort"] = False
+
+    supervise(
+        sweeper.submit(_execute_suite, new_id),
+        "sweep %s" % new_id,
+        lambda exc: _fail_suite(new_id, "%s: %s" % (type(exc).__name__, exc)),
+    )
+    emit(
+        "suite.created",
+        {"suite_id": new_id, "campaign_id": config.campaign_id, "leg": config.leg, "trials": len(trials)},
+    )
+    return suite
+
+
 @app.get("/benchmarks")
 def get_suites(_: str = Depends(require_mesh_token)):
     ranked = _ranked_nodes()
+    index = benchmark.list_suites(BENCHMARK_DIR)
     return {
-        "suites": benchmark.list_suites(BENCHMARK_DIR),
+        "suites": index,
+        "campaigns": benchmark.campaign_summary(index),
         "active_suite_id": active_suite["id"],
         "available_nodes": len(ranked),
         "nodes": [
@@ -2350,7 +2730,11 @@ def resume_suite(suite_id: str, _: str = Depends(require_mesh_token)):
             raise HTTPException(status_code=409, detail="That sweep already finished.")
         active_suite["id"] = suite_id
         active_suite["abort"] = False
-    sweeper.submit(_execute_suite, suite_id)
+    supervise(
+        sweeper.submit(_execute_suite, suite_id),
+        "sweep %s" % suite_id,
+        lambda exc: _fail_suite(suite_id, "%s: %s" % (type(exc).__name__, exc)),
+    )
     return {"status": "resumed"}
 
 

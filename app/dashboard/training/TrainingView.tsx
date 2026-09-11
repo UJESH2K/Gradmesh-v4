@@ -18,7 +18,7 @@ import type { RunDetail } from "@/lib/types";
  * shards finished inside the current round fill in the gap between rounds.
  */
 export default function TrainingView({ canManage }: { canManage: boolean }) {
-  const { mesh, request, events } = useMesh();
+  const { mesh, request, events, connected, error: meshError } = useMesh();
   const [run, setRun] = useState<RunDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [tick, setTick] = useState(0);
@@ -59,6 +59,10 @@ export default function TrainingView({ canManage }: { canManage: boolean }) {
   }, []);
 
   if (error && !run) return <div className="notice notice-danger">{error}</div>;
+
+  // A dead coordinator used to look identical to a run thinking hard: the page
+  // simply kept its last state forever. Say so instead.
+  const offline = !connected || Boolean(meshError);
 
   if (!run) {
     return (
@@ -142,6 +146,14 @@ export default function TrainingView({ canManage }: { canManage: boolean }) {
         </div>
       </div>
 
+      {offline ? (
+        <div className="notice notice-danger">
+          <strong>The coordinator is not responding.</strong> Anything shown below is the last
+          state received, not what is happening now. Check the terminal running{" "}
+          <code className="code-inline">npm run dev</code>.
+        </div>
+      ) : null}
+      
       <section className="train-hero">
         <div className="train-rig">
           <TrainingRig state={rigState} activity={activity} height={300} />

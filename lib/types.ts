@@ -262,6 +262,9 @@ export type SuiteConfig = {
   notes: string;
   trial_timeout_seconds: number;
   settle_seconds: number;
+  /** Legs of one campaign share this and differ only in network_label. */
+  campaign_id: string | null;
+  leg: number;
 };
 
 export type TrialSpec = {
@@ -363,10 +366,13 @@ export type SuiteIndexEntry = {
   completed_trials: number;
   failed_trials: number;
   network_label: string;
+  campaign_id: string | null;
+  leg: number;
 };
 
 export type BenchmarkIndex = {
   suites: SuiteIndexEntry[];
+  campaigns: Campaign[];
   active_suite_id: string | null;
   available_nodes: number;
   nodes: {
@@ -386,4 +392,45 @@ export type SuitePreview = {
   estimated_seconds: number;
   available_nodes: number;
   breakdown: TrialSpec[];
+};
+
+export type NetworkComparisonRow = {
+  suite_id: string;
+  leg: number;
+  network_label: string;
+  trials: number;
+  mean_latency_ms: number | null;
+  train_seconds: number | null;
+  speedup: number | null;
+  efficiency: number | null;
+  map50: number | null;
+  comm_fraction: number | null;
+  comm_bytes: number | null;
+  imbalance: number | null;
+};
+
+export type Campaign = {
+  campaign_id: string;
+  name: string;
+  legs: (SuiteIndexEntry & { leg: number })[];
+  networks: string[];
+  created_at: number;
+  complete_legs: number;
+  comparison?: NetworkComparisonRow[];
+};
+
+export type StandardDatasetEntry = {
+  key: string;
+  name: string;
+  images: number;
+  classes: number;
+  download_mb: number;
+  blurb: string;
+  good_for: string;
+  already_downloaded: boolean;
+};
+
+export type StandardCatalogue = {
+  catalogue: StandardDatasetEntry[];
+  import: { running: boolean; key: string | null; message: string | null; error: string | null };
 };
