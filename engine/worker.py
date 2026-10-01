@@ -224,26 +224,48 @@ def current_load(active_batches: int) -> float:
     return 0.05 if active_batches == 0 else 0.8
 
 
+# Round-trip time of the previous heartbeat, in milliseconds.
+#
+# Latency has to be reported one beat late, and that is not a shortcut. The
+# measurement is of the request itself, so it does not exist until the request
+# has finished, by which point the body has already been sent. The original
+# code started a timer and then read it while building the payload of the call
+# it meant to time, so it measured the construction of a dict and reported it
+# as network latency. Every node in every leg-1 trial reported 0.00 or 0.01 ms,
+# ten microseconds, which is not a wireless link and is not a LAN either. The
+# scheduler's latency term was therefore always zero, and the whole point of
+# running the same sweep on Wi-Fi and on a hotspot was lost.
+_last_latency_ms: float | None = None
+
+
 def send_heartbeat(
     active_batches: int = 0,
     allocated_memory_mb: int = 0,
     training_epoch: int | None = None,
     training_total_epochs: int | None = None,
 ) -> None:
+    global _last_latency_ms
     started = time.perf_counter()
-    http_post(
-        "/heartbeat",
-        {
-            "node_id": NODE_ID,
-            "load": current_load(active_batches),
-            "active_batches": active_batches,
-            "allocated_memory_mb": allocated_memory_mb,
-            "training_epoch": training_epoch,
-            "training_total_epochs": training_total_epochs,
-            "latency_ms": round((time.perf_counter() - started) * 1000, 2),
-        },
-        timeout=10,
-    )
+    try:
+        http_post(
+            "/heartbeat",
+            {
+                "node_id": NODE_ID,
+                "load": current_load(active_batches),
+                "active_batches": active_batches,
+                "allocated_memory_mb": allocated_memory_mb,
+                "training_epoch": training_epoch,
+                "training_total_epochs": training_total_epochs,
+                # None on the first beat. The coordinator keeps its previous
+                # value rather than recording a zero it did not measure.
+                "latency_ms": _last_latency_ms,
+            },
+            timeout=10,
+        )
+    finally:
+        # Timed in `finally` so a beat that timed out still updates the figure
+        # rather than leaving a stale fast reading in place on a dying link.
+        _last_latency_ms = round((time.perf_counter() - started) * 1000, 2)
 
 
 def deregister() -> None:
@@ -376,6 +398,17 @@ def train_batch(batch: dict) -> dict:
             # configuration are not bit-identical. Absent, Ultralytics uses 0.
             if batch.get("seed") is not None:
                 train_options["seed"] = int(batch["seed"])
+            # Ultralytics defaults warmup_epochs to 3.0, which assumes a
+            # training run long enough to leave warmup. A federated round is
+            # one epoch, so with the default every round of every trial runs
+            # entirely inside warmup: momentum restarts at 0.8 and the bias
+            # group sits at warmup_bias_lr = 0.1, which is very large for a
+            # fine-tuned detection head. In leg 1 that produced a model whose
+            # accuracy peaked after round 1 and fell for the remaining four, on
+            # single-machine trials as well as distributed ones, so it was the
+            # schedule rather than the averaging. Absent, the default stands.
+            if batch.get("warmup_epochs") is not None:
+                train_options["warmup_epochs"] = float(batch["warmup_epochs"])
             if ACCELERATOR.backend == "xpu":
                 from ultralytics_xpu import xpu_train
 
@@ -500,9 +533,17 @@ def main() -> None:
     torch = importlib.import_module("torch")
     ACCELERATOR = detect_accelerator(BACKEND, advertised_memory_mb=GPU_MEMORY_MB)
 
-    from probe import probe
+    from probe import diagnose, probe
 
     print("[worker] measuring device capability...")
+
+    # Catch a mismatched CUDA build here rather than on the first shard. The
+    # coordinator rejects a node whose probe measured nothing, so without this
+    # the contributor sees "not eligible" and no reason.
+    mismatch = diagnose(ACCELERATOR)
+    if mismatch:
+        raise SystemExit("\n[worker] " + mismatch + "\n")
+
     capability = probe(ACCELERATOR).as_dict()
     print(
         "[worker] %s via %s, %d MB, %.0f GFLOP/s"
@@ -522,6 +563,13 @@ def main() -> None:
     )
     if not ACCELERATOR.supports_training:
         print("[worker] no supported accelerator was found, so this node will not receive shards")
+    elif not capability.get("gflops"):
+        # The probe ran without raising but measured nothing, which still means
+        # this device cannot do useful work.
+        print(
+            "[worker] the capability probe measured nothing on this device. The mesh will not "
+            "send it training work. Run `npm run doctor` on this machine."
+        )
 
     atexit.register(deregister)
 

@@ -66,6 +66,12 @@ class MeshPolicy:
     cold_start_grace_seconds: float = 240.0  # a worker's first round pays setup costs
     max_dropped_fraction: float = 0.34  # abort the round if more than this is lost
 
+    # A machine that fails this many shards in a row is quarantined rather than
+    # handed more work. Without it, a node that is broken in a way retries
+    # cannot fix, such as a PyTorch build with no kernels for its GPU, absorbs
+    # shard after shard and every round it touches has to be redone.
+    max_consecutive_failures: int = 3
+
     # Learning.
     throughput_ewma_alpha: float = 0.35
     reliability_reward: float = 0.06
@@ -229,6 +235,33 @@ def admit(
                 "%d MB of device memory is below the %d MB floor" % (memory_mb, policy.min_memory_mb),
             )
             continue
+        # A zero measurement is not a slow device, it is a probe that threw.
+        #
+        # This check used to read `if gflops and gflops < floor`, and 0.0 is
+        # falsy, so a machine whose probe crashed skipped the floor entirely and
+        # was admitted at full tier. That is exactly what an RTX 5070 running a
+        # CUDA 12.1 build did: every kernel launch failed, the probe reported
+        # nothing, and the mesh handed it twelve shards in a row, failing each.
+        if capability and not gflops:
+            decisions[node_id] = Admission(
+                node_id,
+                TIER_REJECTED,
+                score,
+                "the capability probe could not run on this device, so its PyTorch build "
+                "most likely has no kernels for this GPU",
+            )
+            continue
+
+        consecutive = int(node.get("consecutive_failures", 0) or 0)
+        if consecutive >= policy.max_consecutive_failures:
+            decisions[node_id] = Admission(
+                node_id,
+                TIER_REJECTED,
+                score,
+                "failed %d shards in a row, so it is quarantined until it reconnects" % consecutive,
+            )
+            continue
+
         if gflops and gflops < policy.min_gflops:
             decisions[node_id] = Admission(
                 node_id,

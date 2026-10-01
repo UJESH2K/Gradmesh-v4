@@ -1,0 +1,20 @@
+# NVIDIA training plane, CUDA 12.1 build.
+#
+# Ships kernels for sm_50 through sm_90: Maxwell, Pascal, Volta, Turing, Ampere,
+# Ada and Hopper. That covers GTX 900 series through RTX 40 series.
+#
+# It does NOT cover Blackwell, which is compute capability 12.0 and includes the
+# RTX 50 series. A Blackwell card running this build fails every kernel launch
+# with "no kernel image is available for execution on the device", which is not
+# a driver problem and cannot be worked around at runtime. Those machines need
+# requirements-train-cu128.txt, and setup picks between them automatically.
+--extra-index-url https://download.pytorch.org/whl/cu121
+-r requirements-control.txt
+torch==2.5.1+cu121
+torchvision==0.20.1+cu121
+ultralytics==8.4.46
+numpy
+opencv-python
+scipy
+# Figures for the benchmark report.
+matplotlib>=3.8

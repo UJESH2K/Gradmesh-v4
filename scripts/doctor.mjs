@@ -14,7 +14,7 @@ import {
   REPO_ROOT,
   STATE_DIR,
   WEB_PORT,
-  detectGpuVendor,
+  detectGpuProfile,
   findSystemPython,
   lanAddresses,
   paint,
@@ -72,7 +72,21 @@ async function main() {
   const datasets = Object.keys(state?.datasets || {}).length;
   check("Datasets", datasets > 0, `${datasets} registered`, "Upload a YOLO dataset zip on the Datasets page");
 
-  check("Accelerator", true, detectGpuVendor(), "");
+  const gpu = detectGpuProfile();
+  check(
+    "Accelerator",
+    true,
+    `${gpu.name}${gpu.capability ? ` (compute ${gpu.capability.toFixed(1)})` : ""} -> ${gpu.label}`,
+    ""
+  );
+  // The most common silent failure: a working install whose kernels do not
+  // cover this card. It looks fine until the first training step.
+  check(
+    "PyTorch matches this GPU",
+    setup.trainingPlane !== "ready" || !setup.profile || setup.profile === gpu.profile,
+    setup.profile ? `installed for ${setup.profile}, this GPU wants ${gpu.profile}` : "not installed yet",
+    "Run: npm run setup. The installed build has no kernels for this GPU."
+  );
 
   const addresses = lanAddresses();
   check(

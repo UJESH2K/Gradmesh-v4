@@ -114,6 +114,48 @@ def probe(accelerator: Accelerator) -> Capability:
     )
 
 
+def diagnose(accelerator: Accelerator) -> Optional[str]:
+    """Explain why this device cannot run kernels, if it cannot.
+
+    A CUDA wheel contains compiled kernels only for the architectures it was
+    built against. Run a newer card against an older wheel and everything looks
+    healthy right up to the first launch, which fails with "no kernel image is
+    available for execution on the device". That message names neither the card
+    nor the fix, and no driver update helps, because the kernels were never
+    compiled. Returns None when the device is fine.
+    """
+    if accelerator.backend != "cuda":
+        return None
+    try:
+        import torch
+
+        major, minor = torch.cuda.get_device_capability(0)
+        target = "sm_%d%d" % (major, minor)
+        arches = list(torch.cuda.get_arch_list())
+        if any(arch == target for arch in arches):
+            return None
+
+        # PTX can be JIT-compiled forward within a major version, so a build
+        # carrying compute_XX at or below this device is still usable.
+        ptx = [int(a.split("_", 1)[1]) for a in arches if a.startswith("compute_") and a.split("_", 1)[1].isdigit()]
+        if any(value <= major * 10 + minor for value in ptx):
+            return None
+
+        return (
+            "This PyTorch build has no kernels for %s (%s). It ships %s. "
+            "Reinstall with the matching build: run `npm run setup` on this machine, "
+            "or rejoin from the mesh's Invite a GPU page, which now picks the build "
+            "from the compute capability."
+            % (
+                torch.cuda.get_device_name(0),
+                target,
+                ", ".join(arches) or "no architectures",
+            )
+        )
+    except Exception:
+        return None
+
+
 def probe_or_none(accelerator: Optional[Accelerator]) -> Optional[dict]:
     if accelerator is None:
         return None

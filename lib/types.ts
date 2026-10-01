@@ -391,6 +391,9 @@ export type SuitePreview = {
   trials: number;
   estimated_seconds: number;
   available_nodes: number;
+  /** Requested machine counts above what is online, so excluded from the design. */
+  dropped_counts: number[];
+  planned_counts: number[];
   breakdown: TrialSpec[];
 };
 

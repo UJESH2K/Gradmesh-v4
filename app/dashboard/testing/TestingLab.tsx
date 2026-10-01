@@ -5,6 +5,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useMesh } from "@/components/dashboard/MeshProvider";
 import { CampaignComparison, CampaignList, NetworkChangePrompt } from "./CampaignPanel";
 import DatasetImporter from "./DatasetImporter";
+import SweepGuide from "./SweepGuide";
 import { Empty, Panel, StatTile } from "@/components/dashboard/ui";
 import { bytes, clock, compact, percent, seconds } from "@/lib/format";
 import type {
@@ -28,6 +29,20 @@ import type {
  */
 
 const DEFAULT_SIZES = [100, 1000];
+
+/**
+ * Ladders worth offering.
+ *
+ * Powers of ten because the dataset-size axis is plotted logarithmically. The
+ * 10-image rung is a pipeline check and is labelled as such: below roughly a
+ * thousand images the run-to-run noise exceeds the effect being measured.
+ */
+const SIZE_PRESETS: { label: string; sizes: number[]; note: string }[] = [
+  { label: "10 · 100", sizes: [10, 100], note: "pipeline check, not a result" },
+  { label: "100 · 1000", sizes: [100, 1000], note: "a first real sweep" },
+  { label: "100 · 1000 · 10000", sizes: [100, 1000, 10000], note: "the full ladder" },
+  { label: "1000 · 5000 · 10000", sizes: [1000, 5000, 10000], note: "large jobs only" },
+];
 
 function defaultConfig(): SuiteConfig {
   return {
@@ -64,6 +79,8 @@ export default function TestingLab({ canManage }: { canManage: boolean }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [handoff, setHandoff] = useState<Suite | null>(null);
+  const [models, setModels] = useState<string[]>([]);
+  const [advanced, setAdvanced] = useState(false);
 
   const patch = (values: Partial<SuiteConfig>) => setConfig((current) => ({ ...current, ...values }));
 
@@ -99,6 +116,9 @@ export default function TestingLab({ canManage }: { canManage: boolean }) {
   useEffect(() => {
     void loadIndex();
     void loadDatasets();
+    request<{ models: { name: string }[] }>("/api/mesh/models")
+      .then((payload) => setModels(payload.models.map((item) => item.name)))
+      .catch(() => {});
     // Intentionally once on mount; the stream drives refreshes after that.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -284,6 +304,8 @@ export default function TestingLab({ canManage }: { canManage: boolean }) {
         </div>
       </div>
 
+      <SweepGuide hasSweeps={(index?.suites ?? []).length > 0} />
+
       {handoff ? (
         <NetworkChangePrompt
           suite={handoff}
@@ -291,6 +313,20 @@ export default function TestingLab({ canManage }: { canManage: boolean }) {
           busy={busy}
           nodesOnline={available}
         />
+      ) : null}
+
+      {preview && preview.dropped_counts?.length ? (
+        <div className="notice notice-warn">
+          <strong>
+            Only {preview.available_nodes} machine{preview.available_nodes === 1 ? "" : "s"}{" "}
+            {preview.available_nodes === 1 ? "is" : "are"} online, so the{" "}
+            {preview.dropped_counts.join(", ")}-machine cell
+            {preview.dropped_counts.length === 1 ? " is" : "s are"} not in this design.
+          </strong>{" "}
+          The trial count above reflects what would actually run. Bring the rest of the machines in
+          from Discover devices first, or the scaling curve will have only{" "}
+          {preview.planned_counts?.join(", ")} on its x-axis.
+        </div>
       ) : null}
 
       {error ? <div className="notice notice-danger">{error}</div> : null}
@@ -374,6 +410,21 @@ export default function TestingLab({ canManage }: { canManage: boolean }) {
                   })
                 }
               />
+              <div className="chip-row" style={{ marginTop: 6 }}>
+                {SIZE_PRESETS.map((preset) => (
+                  <button
+                    key={preset.label}
+                    type="button"
+                    title={preset.note}
+                    className={`chip${
+                      preset.sizes.join(",") === config.dataset_sizes.join(",") ? " is-on" : ""
+                    }`}
+                    onClick={() => patch({ dataset_sizes: preset.sizes })}
+                  >
+                    {preset.label}
+                  </button>
+                ))}
+              </div>
               <p className="hint">
                 Training images per trial, comma separated. 100, 1000, 10000 is the usual ladder.
                 {oversized.length > 0 ? (
@@ -527,6 +578,77 @@ export default function TestingLab({ canManage }: { canManage: boolean }) {
                 adds real time per round.
               </span>
             </label>
+
+            <div className="divider" />
+
+            <button
+              type="button"
+              className="btn btn-ghost btn-sm"
+              style={{ alignSelf: "flex-start" }}
+              onClick={() => setAdvanced((value) => !value)}
+            >
+              {advanced ? "Hide advanced" : "Advanced settings"}
+            </button>
+
+            {advanced ? (
+              <div className="stack">
+                <div className="field">
+                  <label className="label" htmlFor="sweep-model">
+                    Base model
+                  </label>
+                  <select
+                    id="sweep-model"
+                    className="select"
+                    value={config.base_model}
+                    onChange={(event) => patch({ base_model: event.target.value })}
+                  >
+                    {(models.length ? models : [config.base_model]).map((name) => (
+                      <option key={name} value={name}>
+                        {name}
+                      </option>
+                    ))}
+                  </select>
+                  <p className="hint">
+                    Every trial starts from this checkpoint. Use an -obb model only with an
+                    oriented-box dataset.
+                  </p>
+                </div>
+
+                <div className="grid grid-2">
+                  <NumberField
+                    label="Trial timeout (s)"
+                    value={config.trial_timeout_seconds}
+                    min={60}
+                    max={86400}
+                    step={60}
+                    onChange={(value) => patch({ trial_timeout_seconds: value })}
+                    hint="abandons a hung trial rather than losing the night"
+                  />
+                  <NumberField
+                    label="Settle between trials (s)"
+                    value={config.settle_seconds}
+                    min={0}
+                    max={120}
+                    onChange={(value) => patch({ settle_seconds: value })}
+                    hint="lets GPU memory free before the next measurement"
+                  />
+                </div>
+
+                <div className="field">
+                  <label className="label" htmlFor="sweep-notes">
+                    Notes
+                  </label>
+                  <textarea
+                    id="sweep-notes"
+                    className="textarea"
+                    value={config.notes}
+                    placeholder="Anything about this run worth remembering when you read the results in a month."
+                    onChange={(event) => patch({ notes: event.target.value })}
+                  />
+                  <p className="hint">Stored in suite.json alongside the results.</p>
+                </div>
+              </div>
+            ) : null}
           </div>
         </Panel>
 

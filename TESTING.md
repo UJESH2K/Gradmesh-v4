@@ -3,7 +3,61 @@
 Everything needed to produce the numbers a reviewer will ask for, and an honest
 account of what this harness does not measure.
 
-Open **Testing parameters** in the dashboard sidebar.
+Open **Testing parameters** in the dashboard sidebar. Everything below is also
+on that page, under **How to run an experiment**, so the sidebar entry is the
+only thing anybody has to find.
+
+Results from the first full sweep, and what they do and do not support, are in
+[RESULTS-LEG-1.md](RESULTS-LEG-1.md). Read it before designing the next leg: it
+records the dataset size each machine count needs, and four measurement problems
+that cost more the longer they go unfixed.
+
+---
+
+## Every parameter
+
+| Parameter | What it does | Suggested |
+|---|---|---|
+| Sweep name | Label on results and figures. Campaign legs inherit it. | `scaling-sweep` |
+| Parent dataset | The one dataset every trial draws from. Sizes are subsets of it. | 10,000+ images |
+| Dataset sizes | Training images per trial. One results row each. | `100, 1000, 10000` |
+| Machine counts | Which points on the scaling curve to measure. | all of them |
+| Partitioning arms | Capability-proportional, and equal shards as the control. | both |
+| Repeats per cell | Gives the ± in mean ± standard deviation. Each uses a different seed. | 3 minimum |
+| Rounds per trial | One local epoch each, then weights are averaged. | 5 to 10 |
+| Image size | Pixels per side. Doubling it roughly quadruples activation memory. | 640 |
+| Batch ceiling | An upper bound. Each machine gets what its memory can hold. | 8 or 16 |
+| Machine selection | Strongest-first keeps the 2-machine cell the same two machines. | strongest |
+| Network label | Tags the network. Separates lab Ethernet from a hotspot. | `college-wifi` |
+| Score every round | Measures mAP. Required for accuracy columns. Timed separately. | on |
+| Base model | Starting checkpoint. `-obb` only with oriented-box data. | `yolov8n.pt` |
+| Trial timeout | Abandons a hung trial rather than losing the night. | 3600 s |
+| Settle time | Pause between trials so GPU memory frees. | 6 s |
+| Notes | Free text, stored in `suite.json`. | — |
+
+The last four are under **Advanced settings**.
+
+### The image ladder
+
+Powers of ten, because the dataset-size axis is plotted logarithmically:
+`100, 1000, 10000`. Presets for the usual ladders sit under the field.
+
+Add a `10` rung only as a pipeline check, never as a result. Below roughly a
+thousand images the run-to-run noise is larger than the effect being measured,
+which is exactly what a 4-image COCO8 sweep demonstrated: two different requested
+sizes both clamped to 4 images and produced identical rows.
+
+**A size larger than the parent dataset is clamped to the whole of it.** Asking
+for 100 and 1000 images from a 4-image dataset gives two identical rows, not two
+data points.
+
+### How long a sweep takes
+
+Trials = *machine counts × dataset sizes × arms × repeats*, minus the
+equal-shard cells at one machine where the two arms are identical. Four machine
+counts, three sizes, two arms and three repeats is 63 trials; at five rounds each
+that is most of a day. The page shows the trial count and a duration estimate as
+you type, before you commit.
 
 ---
 
@@ -273,6 +327,25 @@ ring all-reduce and therefore no strategy-selection logic to validate. Do not
 claim adaptive topology selection.
 
 ---
+
+## When a machine joins but never trains
+
+Two causes, both now reported rather than silent.
+
+**Its PyTorch build has no kernels for its GPU.** The tell is a machine admitted
+with a dash where its measured throughput should be, then failing every shard
+with `CUDA error: no kernel image is available`. Almost always a Blackwell card,
+the RTX 50 series, on a CUDA 12.1 build. Run `npm run doctor` there, then
+`npm run setup`. The agent now refuses to start in this state instead of joining
+and failing, and admission rejects a node whose probe measured nothing.
+
+**It fails repeatedly for some other reason.** Three consecutive shard failures
+quarantine a machine until it reconnects, so one broken contributor cannot spoil
+every round it touches. The reason appears on the Machines page.
+
+Both matter for a sweep, because a machine that joins and fails still counts
+toward the machine count you designed around, and its cells would otherwise be
+recorded as failures rather than as a hardware problem.
 
 ## Disclosure block
 

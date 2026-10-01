@@ -20,7 +20,7 @@ import {
   REPO_ROOT,
   STATE_DIR,
   VENV_DIR,
-  detectGpuVendor,
+  detectGpuProfile,
   ensureStateDir,
   findSystemPython,
   log,
@@ -139,12 +139,15 @@ async function downloadModels() {
   return present;
 }
 
-/** Requirements profile for whatever accelerator this machine actually has. */
+/**
+ * Requirements profile for whatever accelerator this machine actually has.
+ *
+ * Chosen from the GPU's compute capability, not its name, because a CUDA wheel
+ * only carries kernels for the architectures it was compiled against. See
+ * detectGpuProfile for why that distinction is load-bearing.
+ */
 export function trainingRequirements() {
-  const vendor = detectGpuVendor();
-  if (vendor === "cuda") return { file: "requirements-train.txt", label: "PyTorch CUDA build", backend: "cuda" };
-  if (vendor === "xpu") return { file: "requirements-xpu.txt", label: "PyTorch Intel XPU build", backend: "xpu" };
-  return { file: "requirements-train-cpu.txt", label: "PyTorch CPU build", backend: "cpu" };
+  return detectGpuProfile();
 }
 
 export async function setupControlPlane() {
@@ -158,8 +161,18 @@ export async function setupControlPlane() {
 
 export async function setupTrainingPlane({ quiet = false } = {}) {
   const profile = trainingRequirements();
-  writeSetupState({ trainingPlane: "installing", backend: profile.backend });
-  if (!quiet) log("setup", `installing ${profile.label}, this can take a few minutes`);
+  writeSetupState({
+    trainingPlane: "installing",
+    backend: profile.backend,
+    gpu: profile.name,
+    computeCapability: profile.capability,
+    profile: profile.profile,
+    profileReason: profile.reason,
+  });
+  if (!quiet) {
+    log("setup", `${profile.name}: ${profile.reason}`);
+    log("setup", `installing ${profile.label}, this can take a few minutes`);
+  }
   note(`Installing ${profile.label}.`);
   try {
     await pipInstall(profile.file, profile.label);

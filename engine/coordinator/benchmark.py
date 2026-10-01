@@ -69,7 +69,25 @@ class SuiteConfig:
     node_counts: List[int] = field(default_factory=list)  # empty means 1..available
     strategies: List[str] = field(default_factory=lambda: [PARTITION_PROPORTIONAL])
     repeats: int = 3
-    rounds: int = 5
+    # The single-machine cells are the denominator of every speedup in the
+    # sweep, so their variance contaminates every number in the table. Leg 1
+    # ran them three times and got 302.9 +/- 63.8 s, a 21% coefficient of
+    # variation, which put the headline speedup anywhere between 1.26x and
+    # 1.93x depending on which repeat you divided by. They get more repeats
+    # than the rest of the design for that reason alone.
+    baseline_repeats: int = 5
+    # Two rounds of every trial are spent teaching the throughput estimator
+    # what these machines can do, and the shard plan is poor until it knows.
+    # At five rounds that warmup was 40% of the trial and the whole tax fell
+    # on the proportional arm, which is the arm being judged.
+    rounds: int = 10
+    # Ultralytics defaults warmup_epochs to 3.0. A federated round trains for
+    # one epoch, so with the default every round of every trial runs entirely
+    # inside learning-rate warmup and never reaches the stable phase, with the
+    # bias group held at warmup_bias_lr = 0.1 throughout. Rounds after the
+    # first continue from aggregated weights and are not fresh training runs,
+    # so they should not warm up at all. None restores the Ultralytics default.
+    warmup_epochs: Optional[float] = 0.0
     imgsz: int = 640
     batch_size: int = 8
     node_selection: str = SELECTION_STRONGEST
@@ -112,6 +130,11 @@ class TrialSpec:
     # between planning the sweep and reaching a given cell.
     node_ids: List[str] = field(default_factory=list)
     dataset_id: Optional[str] = None
+    # What the subset actually contained. A request for 1000 images against a
+    # dataset holding 4 silently trains on 4, and leg 1 published a table whose
+    # 100-image and 1000-image rows were the same four images. The requested
+    # size stays in sample_count; this is what ran.
+    effective_sample_count: Optional[int] = None
     # Distinct per repeat so the repeats of a cell actually differ.
     seed: int = 0
 
@@ -134,11 +157,20 @@ class TrialSpec:
 def expand(config: SuiteConfig, available_nodes: int) -> List[TrialSpec]:
     """Expand the factorial design into an ordered list of trials.
 
-    Order is deliberate: node count varies slowest, then dataset size, then
-    strategy, then repeat. A sweep abandoned halfway therefore still contains
-    complete cells for the smaller node counts rather than one repeat of
-    everything, and a partial result you can plot beats a complete result you
-    never finished.
+    Order is deliberate on two counts.
+
+    Node count varies slowest, then dataset size. A sweep abandoned halfway
+    therefore still contains complete cells for the smaller node counts rather
+    than one repeat of everything, and a partial result you can plot beats a
+    complete result you never finished.
+
+    Within a cell, strategy varies fastest and repeat varies second-fastest, so
+    the partitioning arms alternate rather than running in blocks. Leg 1 ran
+    all three proportional trials and then all three equal trials, and one
+    machine happened to run 51% faster during the second block than the first.
+    That drift landed entirely on the strategy variable and made the ablation
+    uninterpretable. Alternating costs nothing and spreads any drift across
+    both arms instead of into the contrast between them.
     """
     counts = [n for n in (config.node_counts or range(1, available_nodes + 1)) if 1 <= n <= available_nodes]
     counts = sorted(set(counts))
@@ -147,14 +179,21 @@ def expand(config: SuiteConfig, available_nodes: int) -> List[TrialSpec]:
     if not strategies:
         strategies = [PARTITION_PROPORTIONAL]
 
+    repeats = max(1, config.repeats)
+    baseline_repeats = max(repeats, config.baseline_repeats)
+
     trials: List[TrialSpec] = []
     index = 0
-    for node_count, sample_count, strategy, repeat in itertools.product(
-        counts, sizes, strategies, range(max(1, config.repeats))
+    for node_count, sample_count, repeat, strategy in itertools.product(
+        counts, sizes, range(max(repeats, baseline_repeats)), strategies
     ):
         # Equal and proportional partitioning are identical on one machine, so
         # running both would waste a slot and put a duplicate in the ablation.
         if node_count == 1 and strategy == PARTITION_EQUAL:
+            continue
+        # Only the baseline cells get the extra repeats.
+        limit = baseline_repeats if node_count == 1 else repeats
+        if repeat >= limit:
             continue
         trials.append(
             TrialSpec(
@@ -237,6 +276,7 @@ def trial_result(spec: TrialSpec, run: dict, status: str, error: Optional[str] =
         "node_count": spec.node_count,
         "node_ids": spec.node_ids,
         "sample_count": spec.sample_count,
+        "effective_sample_count": spec.effective_sample_count,
         "strategy": spec.strategy,
         "repeat": spec.repeat,
         "rounds_completed": run.get("current_round", 0),
@@ -302,6 +342,22 @@ def annotate_baselines(results: Sequence[dict]) -> List[dict]:
     Trials at a dataset size whose baseline never ran get None rather than a
     guess, because a speedup number with no baseline behind it is worse than a
     blank.
+
+    The baseline is the median of its repeats rather than the mean, which is
+    the more robust point estimate but is not on its own a fix. In leg 1 the
+    three baseline repeats at 1000 images were 231.8, 321.8 and 355.1 seconds,
+    because one machine alternated between roughly 15 and 29 images per second.
+    That distribution has two modes, not one outlier, and no single summary of
+    it is trustworthy: the mean gives 1.65x, the median 1.75x, the fastest
+    repeat 1.26x and the slowest 1.93x, all for the same pair of measurements.
+
+    So the point estimate travels with the range it came from.
+    `speedup_low` and `speedup_high` are the same ratio recomputed against the
+    slowest and fastest baseline repeats, and `baseline_spread` is max over min
+    of those repeats. A sweep whose spread is near 1.0 can quote the point
+    estimate plainly. One whose spread is 1.5, as leg 1's was, has to quote the
+    range or be corrected by the first reviewer who reads the standard
+    deviation printed next to the mean.
     """
     rows = [dict(result) for result in results]
 
@@ -315,25 +371,93 @@ def annotate_baselines(results: Sequence[dict]) -> List[dict]:
         ):
             baselines.setdefault(row["sample_count"], []).append(float(row["train_seconds"]))
 
-    means = {size: statistics.fmean(values) for size, values in baselines.items()}
+    medians = {size: statistics.median(values) for size, values in baselines.items()}
+    # max/min over the baseline repeats: 1.0 means they agreed exactly, and
+    # anything much above about 1.15 means the speedups built on it are soft.
+    spreads = {
+        size: (max(values) / min(values)) if min(values) > 0 else None
+        for size, values in baselines.items()
+    }
 
     for row in rows:
         # Keep the intra-round measure under its own name before overwriting.
         row["parallel_speedup"] = row.get("speedup")
         row["parallel_efficiency"] = row.get("efficiency")
 
-        baseline = means.get(row.get("sample_count"))
+        size = row.get("sample_count")
+        baseline = medians.get(size)
         train = row.get("train_seconds")
         if baseline and isinstance(train, (int, float)) and train > 0:
             speedup = baseline / float(train)
             row["baseline_train_seconds"] = round(baseline, 2)
+            row["baseline_runs"] = len(baselines.get(size) or [])
+            row["baseline_spread"] = (
+                round(spreads[size], 3) if spreads.get(size) is not None else None
+            )
             row["speedup"] = round(speedup, 4)
             row["efficiency"] = round(speedup / max(1, row.get("node_count") or 1), 4)
+            # The same ratio against the extreme baseline repeats. These are
+            # the honest bounds on the headline number.
+            repeats = baselines.get(size) or []
+            row["speedup_low"] = round(min(repeats) / float(train), 4) if repeats else None
+            row["speedup_high"] = round(max(repeats) / float(train), 4) if repeats else None
         else:
             row["baseline_train_seconds"] = None
+            row["baseline_runs"] = 0
+            row["baseline_spread"] = None
             row["speedup"] = None
+            row["speedup_low"] = None
+            row["speedup_high"] = None
             row["efficiency"] = None
     return rows
+
+
+def node_stability(results: Sequence[dict]) -> List[dict]:
+    """How steady each machine was across the sweep.
+
+    A machine whose throughput wanders is not a measurement problem to be
+    averaged away, it is the largest single source of variance in the result
+    and it has to be visible. In leg 1 one node ranged from 10.4 to 31.7
+    images per second across trials of the same cell while its partner held
+    within 20%, and because nothing reported that, the drift was read as a
+    difference between partitioning strategies.
+
+    `spread` is max over min. Anything past about 1.5 means that node's numbers
+    describe its background load as much as its hardware.
+    """
+    samples: Dict[str, Dict[str, Any]] = {}
+    for row in results:
+        for node in ((row.get("network") or {}).get("nodes") or []):
+            rate = node.get("throughput_sps")
+            if not isinstance(rate, (int, float)) or rate <= 0:
+                continue
+            entry = samples.setdefault(
+                node.get("node_id") or "?",
+                {"node_id": node.get("node_id"), "name": node.get("name"), "rates": []},
+            )
+            entry["rates"].append(float(rate))
+
+    rows: List[dict] = []
+    for entry in samples.values():
+        rates = entry["rates"]
+        if len(rates) < 2:
+            continue
+        mean = statistics.fmean(rates)
+        stdev = statistics.pstdev(rates)
+        rows.append(
+            {
+                "node_id": entry["node_id"],
+                "name": entry["name"],
+                "trials": len(rates),
+                "throughput_mean_sps": round(mean, 2),
+                "throughput_min_sps": round(min(rates), 2),
+                "throughput_max_sps": round(max(rates), 2),
+                "spread": round(max(rates) / min(rates), 2) if min(rates) > 0 else None,
+                "coefficient_of_variation": round(stdev / mean, 3) if mean > 0 else None,
+                "unstable": bool(min(rates) > 0 and max(rates) / min(rates) >= 1.5),
+            }
+        )
+    return sorted(rows, key=lambda r: r.get("spread") or 0, reverse=True)
 
 
 def aggregate_cells(results: Sequence[dict]) -> List[dict]:

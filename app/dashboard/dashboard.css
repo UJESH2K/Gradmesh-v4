@@ -729,3 +729,93 @@
   padding: 14px;
   background: rgba(255, 255, 255, 0.015);
 }
+
+/* ------------------------------------------------------------------ guide */
+
+/* The runbook, on the page where the work happens. Sits above the controls so
+   the page reads as instructions first, then the thing being instructed. */
+.guide {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.028), rgba(255, 255, 255, 0.006));
+  overflow: hidden;
+}
+
+.guide-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  width: 100%;
+  padding: 15px 20px;
+  background: none;
+  border: none;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  font-size: 0.95rem;
+}
+
+.guide-head:hover {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.guide-toggle {
+  font-size: 0.8rem;
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+.guide-body {
+  border-top: 1px solid var(--line);
+  padding: 18px 20px 20px;
+}
+
+.guide-tabs {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 18px;
+}
+
+.guide-tab {
+  padding: 7px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--line-strong);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text-dim);
+  font-size: 0.83rem;
+  cursor: pointer;
+  transition: all 140ms ease;
+}
+
+.guide-tab:hover {
+  color: var(--text);
+}
+
+.guide-tab.is-on {
+  background: rgba(91, 124, 250, 0.14);
+  border-color: rgba(91, 124, 250, 0.5);
+  color: var(--accent);
+}
+
+.guide-steps {
+  margin: 0;
+  padding-left: 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  color: var(--text-dim);
+  font-size: 0.89rem;
+  line-height: 1.65;
+}
+
+.guide-steps strong {
+  color: var(--text);
+}
+
+.guide-steps a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}

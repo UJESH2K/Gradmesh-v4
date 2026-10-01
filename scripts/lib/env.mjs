@@ -206,7 +206,135 @@ export async function waitForHttp(url, { timeoutMs = 120000, intervalMs = 400 } 
   throw new Error(`Timed out waiting for ${url}`);
 }
 
-export function detectGpuVendor() {
+/**
+ * Which PyTorch build this machine needs.
+ *
+ * Matching on the vendor name alone is not enough, and getting that wrong is
+ * silent until training starts. A CUDA wheel only contains compiled kernels for
+ * the architectures it was built against: the cu12.1 build covers sm_50 through
+ * sm_90, which is Maxwell through Hopper. Blackwell, the RTX 50 series, is
+ * sm_120 and appears in none of them. Such a card installs cleanly, reports
+ * itself as available, and then fails every kernel launch with "no kernel image
+ * is available for execution on the device". No driver update fixes it, because
+ * the kernels were never compiled.
+ *
+ * nvidia-smi reports the compute capability without PyTorch being installed,
+ * which resolves the chicken and egg, and is why the profile is chosen from a
+ * number rather than from a marketing name.
+ */
+export function detectGpuProfile() {
+  const nvidia = queryNvidiaSmi();
+  if (nvidia) {
+    const { name, capability } = nvidia;
+    if (capability === null) {
+      // An old nvidia-smi with no compute_cap field. cu121 covers everything
+      // that shipped before that field existed, so it is the safer guess.
+      return {
+        vendor: "cuda",
+        name,
+        capability: null,
+        profile: "cuda-cu121",
+        file: "requirements-train-cu121.txt",
+        label: "PyTorch CUDA 12.1 build",
+        backend: "cuda",
+        reason: "nvidia-smi did not report a compute capability, assuming pre-Blackwell",
+      };
+    }
+    if (capability >= 12.0) {
+      return {
+        vendor: "cuda",
+        name,
+        capability,
+        profile: "cuda-cu128",
+        file: "requirements-train-cu128.txt",
+        label: "PyTorch CUDA 12.8 build",
+        backend: "cuda",
+        reason: `compute capability ${capability.toFixed(1)} is Blackwell or newer, which needs CUDA 12.8`,
+      };
+    }
+    if (capability >= 5.0) {
+      return {
+        vendor: "cuda",
+        name,
+        capability,
+        profile: "cuda-cu121",
+        file: "requirements-train-cu121.txt",
+        label: "PyTorch CUDA 12.1 build",
+        backend: "cuda",
+        reason: `compute capability ${capability.toFixed(1)} is covered by the CUDA 12.1 build`,
+      };
+    }
+    return {
+      vendor: "cpu",
+      name,
+      capability,
+      profile: "cpu",
+      file: "requirements-train-cpu.txt",
+      label: "PyTorch CPU build",
+      backend: "cpu",
+      reason: `compute capability ${capability.toFixed(1)} is too old for any current PyTorch CUDA build`,
+    };
+  }
+
+  const names = videoControllerNames().toLowerCase();
+  if (names.includes("intel(r) arc") || names.includes("intel arc") || names.includes("intel corporation dg2")) {
+    return {
+      vendor: "xpu",
+      name: "Intel Arc",
+      capability: null,
+      profile: "xpu",
+      file: "requirements-xpu.txt",
+      label: "PyTorch Intel XPU build",
+      backend: "xpu",
+      reason: "an Intel Arc GPU was detected",
+    };
+  }
+
+  return {
+    vendor: "cpu",
+    name: names.split(";")[0] || "unknown",
+    capability: null,
+    profile: "cpu",
+    file: "requirements-train-cpu.txt",
+    label: "PyTorch CPU build",
+    backend: "cpu",
+    reason: "no supported GPU was detected",
+  };
+}
+
+/** Name and compute capability from nvidia-smi, or null when there is no NVIDIA GPU. */
+function queryNvidiaSmi() {
+  try {
+    const probe = spawnSync(
+      "nvidia-smi",
+      ["--query-gpu=name,compute_cap", "--format=csv,noheader"],
+      { encoding: "utf8" }
+    );
+    if (probe.status !== 0 || !probe.stdout) return null;
+
+    // Multiple GPUs: take the most capable, which is what training will use.
+    const rows = probe.stdout
+      .trim()
+      .split(/\r?\n/)
+      .map((line) => line.split(",").map((part) => part.trim()))
+      .filter((parts) => parts[0]);
+    if (rows.length === 0) return null;
+
+    let best = { name: rows[0][0], capability: null };
+    for (const [name, cap] of rows) {
+      const parsed = Number.parseFloat(cap);
+      const capability = Number.isFinite(parsed) ? parsed : null;
+      if (capability !== null && (best.capability === null || capability > best.capability)) {
+        best = { name, capability };
+      }
+    }
+    return best;
+  } catch {
+    return null;
+  }
+}
+
+function videoControllerNames() {
   try {
     if (IS_WINDOWS) {
       const probe = spawnSync(
@@ -214,23 +342,21 @@ export function detectGpuVendor() {
         ["-NoProfile", "-Command", "(Get-CimInstance Win32_VideoController).Name -join ';'"],
         { encoding: "utf8" }
       );
-      return classifyGpu(probe.stdout || "");
+      return probe.stdout || "";
     }
     if (process.platform === "linux") {
       const probe = spawnSync("sh", ["-c", "lspci 2>/dev/null | grep -i 'vga\\|3d\\|display'"], {
         encoding: "utf8",
       });
-      return classifyGpu(probe.stdout || "");
+      return probe.stdout || "";
     }
-    return "cpu";
   } catch {
-    return "cpu";
+    // Fall through to unknown.
   }
+  return "";
 }
 
-function classifyGpu(text) {
-  const value = text.toLowerCase();
-  if (value.includes("nvidia") || value.includes("geforce") || value.includes("rtx")) return "cuda";
-  if (value.includes("intel(r) arc") || value.includes("intel arc")) return "xpu";
-  return "cpu";
+/** Kept for callers that only need the coarse answer. */
+export function detectGpuVendor() {
+  return detectGpuProfile().vendor;
 }

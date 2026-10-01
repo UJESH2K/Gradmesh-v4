@@ -318,6 +318,12 @@ class CreateRunRequest(BaseModel):
     # accuracy and the standard deviation a reviewer asked for is always zero.
     # Timing still varies; accuracy does not.
     seed: int = 0
+    # Learning-rate warmup, in epochs, handed to Ultralytics. A round trains
+    # for one epoch and continues from the aggregated weights, so it is not a
+    # fresh training run and should not warm up. The Ultralytics default of 3.0
+    # means a one-epoch round never leaves warmup at all. None keeps whatever
+    # Ultralytics does by default, which is what earlier runs got.
+    warmup_epochs: Optional[float] = Field(default=0.0, ge=0.0, le=10.0)
 
 
 class PolicyRequest(BaseModel):
@@ -394,7 +400,10 @@ def register_node(req: RegisterRequest, _: str = Depends(require_mesh_token)):
             "last_seen": now,
             "active": True,
             "load": 0.0,
-            "latency_ms": existing.get("latency_ms", 0.0),
+            # None, not 0.0. A node that has not been timed yet is not a
+            # node on a zero-latency link, and the scheduler's latency term
+            # should not reward it for a measurement that never happened.
+            "latency_ms": existing.get("latency_ms"),
             "allocated_memory_mb": 0,
             "active_batches": 0,
             "completed_rounds": existing.get("completed_rounds", 0),
@@ -404,6 +413,9 @@ def register_node(req: RegisterRequest, _: str = Depends(require_mesh_token)):
             # A fresh node starts trusted enough to receive work but not enough
             # to outweigh a node that has actually finished rounds.
             "reliability": existing.get("reliability", 0.7),
+            # Reset on registration: a reconnecting worker has usually been
+            # fixed, so quarantine should not outlive the process that earned it.
+            "consecutive_failures": 0,
             "throughput_sps": existing.get("throughput_sps", 0.0),
             "training_epoch": 0,
             "training_total_epochs": 0,
@@ -546,6 +558,7 @@ def _batch_payload(batch: dict, run: dict) -> dict:
         "estimated_memory_mb": batch["memory_mb"],
         "epochs": 1,
         "seed": int(run.get("seed") or 0),
+        "warmup_epochs": run.get("warmup_epochs"),
         "job_name": run["name"],
         "class_names": run["class_names"],
         "current_round": run["current_round"],
@@ -600,6 +613,7 @@ def submit_round_result(req: RoundResultRequest, _: str = Depends(require_mesh_t
             )
             node["reliability"] = update_reliability(node, True, policy)
             node["completed_rounds"] = node.get("completed_rounds", 0) + 1
+            node["consecutive_failures"] = 0
             node["samples_trained"] = node.get("samples_trained", 0) + batch["samples"]
             node["seconds_trained"] = node.get("seconds_trained", 0.0) + elapsed
             node["active_batches"] = 0
@@ -647,6 +661,7 @@ def submit_batch_failure(req: BatchFailureRequest, _: str = Depends(require_mesh
         if node is not None:
             node["reliability"] = update_reliability(node, False, current_policy())
             node["failed_rounds"] = node.get("failed_rounds", 0) + 1
+            node["consecutive_failures"] = int(node.get("consecutive_failures", 0) or 0) + 1
             node["active_batches"] = 0
             node["allocated_memory_mb"] = 0
         run_id = batch["run_id"]
@@ -734,6 +749,7 @@ def create_run(req: CreateRunRequest, _: str = Depends(require_mesh_token)):
         "current_round": 0,
         "imgsz": req.imgsz,
         "batch_size": req.batch_size,
+        "warmup_epochs": req.warmup_epochs,
         "notes": req.notes,
         "weights_b64": None,
         "round_history": [],
@@ -2308,6 +2324,10 @@ def _execute_suite(suite_id: str) -> None:
         try:
             dataset = _ensure_subset(parent, spec.sample_count)
             spec.dataset_id = dataset["id"]
+            # A request for more images than the dataset holds is served the
+            # whole dataset. Record what trained, so a row that says 1000 can
+            # never again mean 4.
+            spec.effective_sample_count = int(dataset.get("train_count") or 0)
         except Exception as exc:
             suite.setdefault("results", []).append(
                 benchmark.trial_result(spec, {}, benchmark.STATUS_FAILED, "subset failed: %s" % exc)
@@ -2336,6 +2356,7 @@ def _execute_suite(suite_id: str) -> None:
                     imgsz=config.imgsz,
                     batch_size=config.batch_size,
                     mode="mesh",
+                    warmup_epochs=config.warmup_epochs,
                     node_ids=spec.node_ids,
                     partition_strategy=spec.strategy,
                     evaluate=config.evaluate,
@@ -2482,6 +2503,34 @@ def create_suite(req: SuiteRequest, _: str = Depends(require_mesh_token)):
             raise HTTPException(status_code=409, detail="No eligible machine is online.")
 
         config.parent_dataset_id = parent["id"]
+
+        # A dataset size larger than the dataset is silently served the whole
+        # dataset, so two different rungs of the ladder can train on exactly
+        # the same images and be reported as different conditions. Leg 1 ran
+        # eighteen trials against COCO8, which holds four training images, and
+        # published a size axis in which 100 and 1000 were both 4.
+        train_count = int(parent.get("train_count") or 0)
+        requested = sorted({int(size) for size in config.dataset_sizes if size and size > 0})
+        if train_count and requested:
+            effective = sorted({min(size, train_count) for size in requested})
+            if len(effective) < len(requested):
+                collapsed = [size for size in requested if size > train_count]
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "%s holds %d training images, so %s would all train on the same %d "
+                        "images and the dataset-size axis would not exist. Pick sizes at or "
+                        "below %d, or choose a larger dataset."
+                        % (
+                            parent.get("name") or "That dataset",
+                            train_count,
+                            " and ".join(str(size) for size in collapsed),
+                            train_count,
+                            train_count,
+                        )
+                    ),
+                )
+
         if not config.campaign_id:
             config.campaign_id = uuid.uuid4().hex[:10]
         trials = benchmark.expand(config, len(ranked))
@@ -2549,12 +2598,23 @@ def preview_suite(req: SuiteRequest, _: str = Depends(require_mesh_token)):
     """Trial count and rough duration for a configuration, before committing."""
     config = benchmark.SuiteConfig.from_dict(req.config)
     ranked = _ranked_nodes()
-    trials = benchmark.expand(config, max(1, len(ranked)))
+    available = max(1, len(ranked))
+    trials = benchmark.expand(config, available)
     best = max((float(n.get("throughput_sps") or 0.0) for n in ranked), default=0.0)
+
+    # A machine count above what is online is dropped from the design. Saying so
+    # matters: somebody planning a six-machine sweep before the machines arrive
+    # would otherwise see a small trial count with no explanation and assume the
+    # design did not take.
+    requested = sorted(set(config.node_counts or []))
+    dropped = [count for count in requested if count > available]
+
     return {
         "trials": len(trials),
         "estimated_seconds": round(benchmark.estimate_seconds(trials, config, best), 1),
         "available_nodes": len(ranked),
+        "dropped_counts": dropped,
+        "planned_counts": sorted({spec.node_count for spec in trials}),
         "breakdown": [spec.as_dict() for spec in trials[:60]],
     }
 

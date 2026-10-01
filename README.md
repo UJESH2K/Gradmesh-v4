@@ -243,6 +243,48 @@ round, which is a diagnostic. Quote the first.
 Full methodology, dataset sources, and an explicit list of what the harness does
 **not** measure are in [TESTING.md](TESTING.md).
 
+## GPU support, and the one failure worth knowing about
+
+Setup picks the PyTorch build from the GPU's **compute capability**, read from
+`nvidia-smi` before PyTorch exists, rather than from the card's name.
+
+| Hardware | Compute | Build installed |
+|---|---|---|
+| RTX 50 series, B100, B200 (Blackwell) | 12.0 | CUDA 12.8, torch 2.7 |
+| GTX 900 through RTX 40 series, A100, H100 | 5.0 to 9.0 | CUDA 12.1, torch 2.5 |
+| Intel Arc | — | PyTorch XPU |
+| Anything else | — | CPU build, joins but receives no shards |
+
+This distinction is load-bearing rather than pedantic. A CUDA wheel contains
+compiled kernels only for the architectures it was built against. The 12.1 build
+stops at `sm_90`; Blackwell is `sm_120`. Install it on an RTX 5070 and everything
+looks healthy, `torch.cuda.is_available()` returns true, and then every kernel
+launch fails with:
+
+```
+CUDA error: no kernel image is available for execution on the device
+```
+
+No driver update fixes that, because the kernels were never compiled. Selecting
+by name would put a 5070 and a 3090 on the same wheel, and exactly one of them
+would work.
+
+Three things now catch it:
+
+- **Setup and the join script** choose the build from the capability, so the
+  right wheel is installed in the first place.
+- **The worker refuses to start** on a mismatch, naming the card, the
+  architectures its build ships, and the fix, instead of registering and failing
+  later.
+- **Admission rejects a node whose probe measured nothing.** A zero is a crashed
+  probe, not a slow device. That check previously read `if gflops and ...`, and
+  `0.0` is falsy, so a broken machine skipped the floor entirely and was handed
+  shard after shard. A machine that fails three in a row is now quarantined until
+  it reconnects.
+
+`npm run doctor` reports the card, its capability, the build installed, and
+whether they match.
+
 ## Architecture
 
 ```
@@ -441,6 +483,16 @@ the host's address has changed.
 **Runs will not start.** Aggregation needs PyTorch on the host. The dashboard
 banner shows install progress; wait for it, or run `npm run setup`.
 
+**"no kernel image is available for execution on the device".** The installed
+PyTorch has no kernels for that GPU, almost always a Blackwell card on a CUDA
+12.1 build. Run `npm run doctor` on that machine to confirm, then `npm run setup`
+to reinstall, or rejoin from the Invite a GPU page. Newer agents refuse to start
+rather than joining broken.
+
+**A machine shows as not eligible with "the capability probe could not run".**
+Same cause as above. The probe runs a small matmul, and if that throws the device
+cannot do useful work.
+
 **A worker runs out of GPU memory.** Batch size is already capped per device, so
 this should be rare. If it still happens, lower the batch size on the run form:
 it is a ceiling for the whole run, and each machine gets at most that.
@@ -522,3 +574,5 @@ v4's contribution is the scheduling policy that makes the answer depend on
 something other than owning matched hardware. The model, the assertions that
 pin it down, and the measurement methodology are in
 [RESEARCH.md](RESEARCH.md).
+#   G r a d m e s h - v 5  
+ 

@@ -12,7 +12,8 @@ export const AGENT_FILES = [
   "probe.py",
   "worker.py",
   "requirements-control.txt",
-  "requirements-train.txt",
+  "requirements-train-cu121.txt",
+  "requirements-train-cu128.txt",
   "requirements-train-cpu.txt",
   "requirements-xpu.txt",
 ] as const;

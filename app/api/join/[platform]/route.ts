@@ -102,15 +102,56 @@ foreach ($file in @(${files})) {
 Write-Ok "agent downloaded"
 
 # --- Accelerator ------------------------------------------------------------
-$gpuNames = ''
-try { $gpuNames = ((Get-CimInstance Win32_VideoController).Name -join ';').ToLower() } catch { }
+# The PyTorch build is chosen from the GPU's compute capability, not its name.
+# A CUDA wheel only contains kernels for the architectures it was compiled
+# against: the 12.1 build covers sm_50 to sm_90, which stops at Hopper. A
+# Blackwell card, meaning the RTX 50 series at compute 12.0, installs that build
+# cleanly, reports CUDA as available, and then fails every kernel launch with
+# "no kernel image is available for execution on the device". nvidia-smi reports
+# the capability without PyTorch present, which is how this is decided up front
+# rather than discovered during the first training round.
+$Requirements = 'requirements-train-cpu.txt'; $Backend = 'auto'; $Label = 'CPU'
+$ComputeCap = $null
+$GpuName = ''
 
-if ($gpuNames -match 'nvidia|geforce|rtx|quadro|tesla') {
-  $Requirements = 'requirements-train.txt'; $Backend = 'cuda'; $Label = 'NVIDIA CUDA'
-} elseif ($gpuNames -match 'intel\\(r\\) arc|intel arc') {
-  $Requirements = 'requirements-xpu.txt'; $Backend = 'xpu'; $Label = 'Intel XPU'
+try {
+  $smi = & nvidia-smi --query-gpu=name,compute_cap --format=csv,noheader 2>$null
+  if ($LASTEXITCODE -eq 0 -and $smi) {
+    foreach ($line in @($smi)) {
+      $parts = $line -split ','
+      if ($parts.Length -ge 2) {
+        $cap = 0.0
+        if ([double]::TryParse($parts[1].Trim(), [ref]$cap)) {
+          if ($null -eq $ComputeCap -or $cap -gt $ComputeCap) {
+            $ComputeCap = $cap; $GpuName = $parts[0].Trim()
+          }
+        }
+      }
+    }
+  }
+} catch { }
+
+if ($null -ne $ComputeCap) {
+  if ($ComputeCap -ge 12.0) {
+    $Requirements = 'requirements-train-cu128.txt'; $Backend = 'cuda'
+    $Label = "NVIDIA CUDA 12.8 (compute $ComputeCap, Blackwell or newer)"
+  } elseif ($ComputeCap -ge 5.0) {
+    $Requirements = 'requirements-train-cu121.txt'; $Backend = 'cuda'
+    $Label = "NVIDIA CUDA 12.1 (compute $ComputeCap)"
+  } else {
+    $Label = "CPU ($GpuName at compute $ComputeCap is too old for current PyTorch)"
+  }
 } else {
-  $Requirements = 'requirements-train-cpu.txt'; $Backend = 'auto'; $Label = 'CPU'
+  $gpuNames = ''
+  try { $gpuNames = ((Get-CimInstance Win32_VideoController).Name -join ';').ToLower() } catch { }
+  if ($gpuNames -match 'nvidia|geforce|rtx|quadro|tesla') {
+    # An NVIDIA card with no working nvidia-smi. 12.1 covers everything that
+    # predates the compute_cap field, so it is the safer guess.
+    $Requirements = 'requirements-train-cu121.txt'; $Backend = 'cuda'
+    $Label = 'NVIDIA CUDA 12.1 (nvidia-smi unavailable, assuming pre-Blackwell)'
+  } elseif ($gpuNames -match 'intel\\(r\\) arc|intel arc') {
+    $Requirements = 'requirements-xpu.txt'; $Backend = 'xpu'; $Label = 'Intel XPU'
+  }
 }
 Write-Ok "detected $Label"
 
@@ -179,19 +220,42 @@ for file in ${files}; do
 done
 
 # --- Accelerator ------------------------------------------------------------
-GPU=""
-if command -v lspci >/dev/null 2>&1; then
-  GPU=$(lspci 2>/dev/null | grep -iE 'vga|3d|display' | tr '[:upper:]' '[:lower:]' || true)
+# Chosen from compute capability, not the card's name. See the note in the
+# PowerShell variant: a CUDA wheel only carries kernels for the architectures it
+# was built against, and a Blackwell card on the 12.1 build fails every kernel
+# launch despite installing and detecting cleanly.
+REQUIREMENTS="requirements-train-cpu.txt"; BACKEND="auto"; LABEL="CPU"
+COMPUTE_CAP=""
+
+if command -v nvidia-smi >/dev/null 2>&1; then
+  COMPUTE_CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null \\
+    | tr -d ' ' | sort -rn | head -n 1 || true)
 fi
 
-case "$GPU" in
-  *nvidia*|*geforce*)
-    REQUIREMENTS="requirements-train.txt"; BACKEND="cuda"; LABEL="NVIDIA CUDA" ;;
-  *"intel corporation dg2"*|*"intel arc"*)
-    REQUIREMENTS="requirements-xpu.txt"; BACKEND="xpu"; LABEL="Intel XPU" ;;
-  *)
-    REQUIREMENTS="requirements-train-cpu.txt"; BACKEND="auto"; LABEL="CPU" ;;
-esac
+if [ -n "$COMPUTE_CAP" ]; then
+  CAP_MAJOR=\${COMPUTE_CAP%%.*}
+  if [ "$CAP_MAJOR" -ge 12 ] 2>/dev/null; then
+    REQUIREMENTS="requirements-train-cu128.txt"; BACKEND="cuda"
+    LABEL="NVIDIA CUDA 12.8 (compute $COMPUTE_CAP, Blackwell or newer)"
+  elif [ "$CAP_MAJOR" -ge 5 ] 2>/dev/null; then
+    REQUIREMENTS="requirements-train-cu121.txt"; BACKEND="cuda"
+    LABEL="NVIDIA CUDA 12.1 (compute $COMPUTE_CAP)"
+  else
+    LABEL="CPU (compute $COMPUTE_CAP is too old for current PyTorch)"
+  fi
+else
+  GPU=""
+  if command -v lspci >/dev/null 2>&1; then
+    GPU=$(lspci 2>/dev/null | grep -iE 'vga|3d|display' | tr '[:upper:]' '[:lower:]' || true)
+  fi
+  case "$GPU" in
+    *nvidia*|*geforce*)
+      REQUIREMENTS="requirements-train-cu121.txt"; BACKEND="cuda"
+      LABEL="NVIDIA CUDA 12.1 (nvidia-smi unavailable, assuming pre-Blackwell)" ;;
+    *"intel corporation dg2"*|*"intel arc"*)
+      REQUIREMENTS="requirements-xpu.txt"; BACKEND="xpu"; LABEL="Intel XPU" ;;
+  esac
+fi
 printf '\\033[32m  detected %s\\033[0m\\n' "$LABEL"
 
 # --- Environment ------------------------------------------------------------
